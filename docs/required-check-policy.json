@@ -1,0 +1,11 @@
+{
+  "schema": "headless-pr-workflow.required-check-policy.v1",
+  "branches": {
+    "main": {
+      "required_status_checks": "required",
+      "ci_workflows": "present_required",
+      "source": "docs/MERGE-POLICY.md#main-required-check-policy",
+      "rationale": ".github/workflows/tests.yml runs the pytest check, and GitHub branch protection on main requires it. Tooling defers to GitHub's live required-check status; the absent-by-policy bypass does not apply to main."
+    }
+  }
+}

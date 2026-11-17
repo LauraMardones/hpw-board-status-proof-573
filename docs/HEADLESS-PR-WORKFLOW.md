@@ -1,0 +1,200 @@
+# Headless PR Workflow
+
+This document defines the normative workflow for assistant-agnostic, GitHub-centered pull request work.
+
+## Non-Negotiable Invariants
+
+- GitHub is the system of record for issues, pull requests, reviews, approvals, CI status, blockers, and merge state.
+- Local branches, worktrees, editor state, terminal history, and assistant chat sessions are disposable execution contexts.
+- A review approval applies only to the exact PR head SHA that was reviewed.
+- If new commits are pushed after approval, approval must be re-evaluated against the new head SHA.
+- Implementation and review must not happen in the same session for the same reviewed head SHA.
+- Merge is allowed only after a fresh GitHub refresh confirms current head SHA, approvals, CI, blockers, target branch, and merge owner.
+- Takeover between assistants, machines, and sessions must be recoverable from GitHub state plus explicit handoff notes.
+- Repo-specific constraints must be implemented through adapters, not core workflow policy.
+- Assistant-specific behaviors must be optional integrations, not normative requirements.
+- The workflow never requires the Human Approver to poll for state; every point that needs human judgment is pulled to them as a decidable notification, see [Human Attention Is Pulled, Not Polled](#human-attention-is-pulled-not-polled).
+
+## Lifecycle
+
+The workflow loops until the PR is either merged or intentionally abandoned:
+
+1. Issue or task context is selected from GitHub.
+2. An implementation session creates or takes over a branch/worktree.
+3. Implementation produces commits and pushes them to the PR branch.
+4. Review readiness checks run against the current GitHub PR state.
+5. A separate review session reviews the current head SHA.
+6. Blockers are recorded in GitHub review threads, comments, checks, or issue/PR metadata.
+7. If blockers require changes, a new implementation loop pushes a new head SHA.
+8. Approval is re-evaluated after every new push.
+9. Merge readiness checks run after a fresh GitHub refresh.
+10. The merge owner merges only the approved current head SHA.
+11. Post-merge sync and cleanup are performed.
+
+## State Model
+
+The workflow distinguishes between durable and temporary state.
+
+Durable state:
+
+- GitHub issue state.
+- GitHub PR state.
+- PR head SHA.
+- Reviews and approvals.
+- Review threads and unresolved blockers.
+- CI checks and check suites.
+- Merge commit and merged branch state.
+- Explicit handoff notes stored in GitHub or committed workflow metadata.
+
+Temporary state:
+
+- Local branch checkout.
+- Worktree path.
+- Assistant session memory.
+- Terminal scrollback.
+- Local scratch files.
+- Unpushed commits.
+
+Temporary state can help execution, but it must not be required to determine PR truth.
+
+## Review Separation
+
+For a reviewed head SHA, the same assistant session must not both implement and approve/review that SHA. A session may implement fixes after review, but the resulting new head SHA requires review by a separate review session.
+
+This rule prevents self-review loops where an assistant validates its own implementation without an independent review context.
+
+## Independent Review Flow
+
+The approval gate is satisfied when a reviewer independent of the implementer found no blockers on the exact current head SHA (ADR-007). One maintainer with one GitHub account is the normal case; the workflow preserves review separation without inventing extra GitHub accounts or pretending that a formal GitHub approval exists.
+
+`MERGE-POLICY.md` → Approval Gate: Independent Review defines the three kinds of evidence and when each fails closed:
+
+1. A clean Codex review of the current head (the default for Claude-implemented stories). It needs a linked story; a PR with no linked story uses path 2 or path 3.
+2. A separate-session review recorded as a PR review summary on the current head, naming the reviewing provider, which must differ from the implementing provider.
+3. A formal GitHub approval of the current head.
+
+Satisfying the approval gate does not waive any other merge condition:
+
+- The review must still come from a reviewer independent of the session that implemented the current head SHA.
+- The evidence must still be recorded on GitHub for the exact current head SHA.
+- The PR must still be Ready for review, not draft.
+- Required CI/checks must still pass for the current head SHA.
+- Blocking review threads or comments must still be resolved, outdated, or explicitly waived according to repo policy.
+- The merge owner must still perform a fresh GitHub refresh immediately before merge.
+
+Practical sequence:
+
+1. The implementation session pushes the candidate head SHA and requests review without self-approving that SHA.
+2. An independent reviewer reviews the exact current head SHA: Codex posts its result on the PR, or a separate review session refreshes GitHub state and records blockers or a no-blockers PR review summary.
+3. A separate review session that finds no blockers records the review summary described in `MERGE-POLICY.md` → Path 2, including the `Reviewer provider:` line, or a formal approval when GitHub allows it. The session generates the summary text with `hpw review-evidence-text` instead of composing it, and confirms with `hpw approval-check` that it was accepted.
+4. If the review finds blockers, the implementation session makes changes and pushes a new head SHA. The earlier review is then stale and the loop restarts.
+5. After a no-blockers review exists for the current head SHA, the merge owner performs a fresh refresh and re-checks merge readiness before merging that same SHA.
+
+A separate-session review summary makes three facts explicit:
+
+- No blockers remain for the exact current head SHA.
+- Which provider reviewed it.
+- The review is the approval to rely on for that current head SHA.
+
+The evidence surface for a separate-session review is the GitHub PR review submission summary attached to the reviewed head SHA. The evidence surface for a Codex review is the Codex bot's PR conversation comment naming the reviewed commit. No other top-level issue or PR conversation comment is a source of approval evidence.
+
+This keeps the flow compatible with deterministic commands:
+
+- `approval-check` treats evidence as satisfying the approval gate only when its recognizer accepts it for the current head SHA, and reports the source (`formal`, `codex-review` or `separate-session-review`) and the reason for any rejection.
+- `pr-context` normalizes review submissions from `latestReviews` and `reviews`, and reads the PR timeline, commits and linked stories the recognizers need. When these cannot be read completely, the Codex review and separate-session review paths fail closed.
+- `pre-merge` must still fail if the PR is draft, if checks are missing or failing, if mergeability is bad, if unresolved review threads remain active, or if the reviewed SHA is no longer current.
+
+### Codex review loop
+
+For a Claude-implemented story (`executor:claude-code-*`), the review is requested and followed up without a review session (ADR-006):
+
+1. **Request on ready.** `/implement` opens the PR as a draft and pushes freely. When it marks the PR Ready for review, it posts one PR conversation comment that starts with the Codex review trigger phrase from ADR-006 → Decision. After a round of fixes for Codex findings it posts exactly one new request, after the round's last push and after the story is back in `In review`. It posts no request on intermediate pushes, none on an issue, and none for an `executor:codex` story.
+2. **The bookkeeping job.** `.github/workflows/codex-review-bookkeeping.yml` runs `hpw codex-review-bookkeeping` when the Codex bot comments on or reviews a PR, every 15 minutes for every open, non-draft PR, and on manual dispatch. It calls no model. An event only names the PR: the job reads the PR fresh from GitHub and decides from current facts, so a redelivered event is a no-op. It runs with the `PROJECT_TOKEN` secret; the scopes that token needs are listed in [DISPATCHER-CONFIG.md → GitHub Token — `PROJECT_TOKEN`](DISPATCHER-CONFIG.md#github-token--project_token).
+3. **When it acts.** Only when the PR is open and not a draft, it has exactly one linked story with exactly one `executor:` label starting with `executor:claude-code-`, and that story's board status is exactly `In review` or `Blocked` (issue #478: the board writer shows `Blocked` while a blocker is open on the story, for example the job's own; an open decision blocker still holds the job, see below). Otherwise it does nothing and reports why.
+
+"For the current head" means after the last commit or force-push in the PR timeline.
+
+| Situation on the current head | Action |
+|---|---|
+| Clean Codex review accepted by the approval gate, required checks green, no unresolved review thread other than superseded Codex threads | Resolve the superseded Codex threads; post the Session Summary (`Next: merge`) listing them. No board status is written: the board writer shows `Mergeable` once the merge gates pass. |
+| Clean, required checks green, but an unresolved thread the job may not resolve (a human's thread, a Codex thread on the current head, or a Codex thread whose review commit cannot be read) that the review-thread gate blocks on | Resolve nothing and post no Session Summary; one `Type: external` blocker on the story naming each remaining thread and why. |
+| Clean, but a reviewer requested changes | Nothing. The approval gate does not pass, and that reviewer owns the next step. |
+| Clean, a required check still running | Nothing; the scheduled run looks again. |
+| Clean, a required check failed | Post the Session Summary naming the check (`Next: implementation`); no board status is written. |
+| Codex review with findings | Post the Session Summary linking the review (`Next: implementation`); no board status is written. |
+| Usage-limit reply, or a request with no answer | Nothing until the back-off has passed, then one new review request. |
+| No request for the current head | One review request. |
+| Reply in an unknown format | No Session Summary; one `Type: external` blocker on the story naming the reply. |
+| The job has posted its maximum number of requests for the head and another is due | One `Type: resource` blocker on the story; no further request for that head. |
+
+Rules:
+
+- **Fix round classifies first.** Before changing code, `/implement` classifies each unresolved finding as Blocker (fixed in the PR) or Out of scope (a valid observation the story does not own). An Out of scope finding is one of two kinds. A catch-all-kind finding (about code the PR did not add or change) gets a catch-all issue and a reply whose first two lines are the fixed reply lines, and `hpw resolve-catch-all-thread` resolves its thread after fresh checks ([MERGE-POLICY.md → Path 3](MERGE-POLICY.md#path-3-formal-github-approval)); it needs no waiver, and when the helper fails or cannot run it is handled as waiver kind for that round. A round whose Out of scope findings are all catch-all kind, with every thread confirmed resolved, declares no waiver blocker and posts its one review request. A waiver-kind finding (an edge case outside the acceptance criteria, or an Epic or Feature requirement the story did not take on) gets a follow-up issue and a reply on its thread; the thread stays unresolved. In doubt, a finding is waiver kind, or a Blocker. A round with only Out of scope findings, at least one of them waiver kind, pushes nothing, posts no review request and declares one `Type: decision` blocker asking the PO to waive. Only the PO waives, with a PR comment naming each finding and its follow-up issue plus `/unblock`; the PO also resolves each waived thread on GitHub, because a Codex thread on the current head is never superseded by a later review of the same head. The next `/implement` then returns the story to `In review` and posts one new review request. A classification is not a waiver, and no merge gate changes.
+- **Pending waiver holds the story (issue #357).** A story has an *open decision blocker* when its latest comment with `## Blocked Declaration` and `Type: decision` has no later comment by the PO with a line that is exactly `/unblock` (the rule of `docs/PROJECT-STATUS.md`, Decision blockers). While one is open, the `codex-review-bookkeeping` job decides `none` for an `In review` or `Blocked` story, whatever the Codex result and without reading the required checks (it reads the blocker first, so a failing checks read cannot turn the hold into a failed run): no review request, no thread resolution, no move, no blocker and no Session Summary. The job reads the blocker again before its first mutation, so a blocker that appears mid-run changes nothing. The PO's `/unblock` lifts the hold and the job decides as usual, for example it posts the one review request for a head that has none. The post-waiver `/implement` pushes nothing: once the session has posted a review request after the PO's `/unblock`, the dispatcher records the fix-round attempt for that head and does not report the missing push as a failure (without that request the head's latest Codex result is still the waived findings, so the dispatcher posts a `Type: external` blocker naming the missing request instead); it does the same for an only-Out-of-scope round that declared the blocker during the session. A round with no such blocker that pushes nothing still ends with the `Type: external` "pushed no new commit" blocker. The post-waiver review request comes once, from the `/implement` session (story `In implementation`) or from the job (story already `In review`), because the job posts only for a head with no request.
+- **Fix round fixes the class.** For each Blocker, `/implement` names the defect class, searches the PR's own change (its diff and the code it calls or is called by) for other instances of that class, and fixes every instance in code or text the PR added or changed, in the same round and before pushing. An instance found only in unchanged code is Out of scope under the rule above, not a reason to widen the PR. The fix-round Session Summary records one `Class check` `--deviation` line per Blocker naming the class, the locations checked, the other locations fixed (or `none`) and any out-of-scope follow-up (or `none`), so the PO and the next reviewer can see where the implementer looked.
+- **Progress comment.** Codex keeps one "Codex Review Summary" comment up to date on the PR. It is not a reply: a request stays pending while it says a review is running.
+- **Bounds.** Two repository variables set the bounds, so the PO changes them without a code change: `CODEX_REVIEW_RETRY_HOURS` (back-off, default `5`, the Codex usage window) and `CODEX_REVIEW_MAX_REQUESTS` (requests the job posts per head, default `3`).
+- **Blockers** use the Declaration format in `PROJECT-STATUS.md` and are posted on the story; the board writer then shows it as `Blocked`, and the job still acts on the next Codex result for it. The job itself sends nothing and keeps no state; each `Type: external` or `Type: resource` blocker it posts reaches the PO as a retried Slack `po_blocker` event, which the dispatcher's `retry` step registers from a scan of these blockers on every cycle (`dispatcher-notify-retry.sh scan-job-blockers`, [DISPATCHER-CONFIG.md](DISPATCHER-CONFIG.md), issue #393).
+- **Session Summary.** The job posts the exact output of `scripts/session-summary.sh --command review` as a PR comment. Its `Deviation:` line says the bookkeeping job produced it without a model session.
+- **No board write (issue #478).** The job writes no board status. Its Session Summary and marker are the record of the hand-off: the dispatcher reads the findings marker to start a fix round, and its board writer (`hpw dispatcher status sync`, [DISPATCHER-CONFIG.md](DISPATCHER-CONFIG.md)) shows the story's status on its next run. Until then the story still shows `In review`, and a later run of the job finds its own Session Summary for the head and does nothing.
+- **Idempotency.** Every comment the job posts ends with a hidden marker naming the PR head and the kind of action. The job skips anything already done for that head. All state lives on GitHub.
+- **Review threads.** On a clean result accepted by the approval gate with green required checks, the job reads all review threads of the PR completely. It resolves an unresolved thread only when the Codex bot opened it (first comment by the bot account, type `Bot`; replies never change this) in a review of a known commit other than the current head, whether or not GitHub shows it as outdated. A thread opened by any other account, a Codex thread from a review of the current head, and a Codex thread whose review commit cannot be read are never resolved. The order of mutations is: resolve the threads, then post the Session Summary. The Session Summary lists each resolved thread with its link, the commit of the Codex review that opened it and the clean Codex result that superseded it, or says no Codex threads were resolved; after a partial failure the next run finishes the rest and the single Session Summary also lists the superseded Codex threads already resolved. The blocker is unblocked when the listed threads are resolved on GitHub or a new head is pushed; the next run then posts the Session Summary. This is resolution on Codex's own later evidence, not a waiver ([MERGE-POLICY.md](MERGE-POLICY.md#path-1-clean-codex-review)); the review-thread gate of `/merge` is unchanged.
+- **Fresh refresh.** Nothing is posted or moved on the strength of one read. Immediately before the first mutation the job reads the PR, the story status, the required checks, the review threads (when read) and the story comments again and decides again. It acts only when both readings lead to the same decision; otherwise it stops with an error and changes nothing, and the next run decides for the new state. A change in the instant after the second read cannot be excluded by any job; `/merge` refreshes every gate again before merging.
+- **Failure.** When PR, story or board state cannot be read completely, or a mutation fails, the command exits non-zero, names the failed step and claims no action it did not complete. When GitHub refuses a read or write because the token lacks a scope, the error names the missing scope and the token section linked above, for example ``PR #<n>: failed at step `read PR`: the GitHub token lacks a required scope: `read:org` …``. A missing scope is a failure like any other: the PR is never skipped or reported as "nothing to do".
+- **Failure notification.** A failed run sends the PO one Slack `dispatcher_error` message through `scripts/slack-notify.sh`: the PR number, the failed step and the shortened error text (three PRs at most, then a count), and the run link as the last action. A token-like string in the text is masked. The rule reads only this workflow's run history (runs that finished as a success or a failure; cancelled and skipped runs are ignored): a message goes out when the last earlier such run was a success or there is none, or when it failed on an earlier UTC calendar day, so a lasting failure is announced at most once a day. If the history cannot be read, the run sends one message and writes a `::warning::`. Exit code `3` means the only failure was a PR that changed during the run (`revalidate decision`); nothing was posted or moved, the run is green with a `::warning::`, and no message is sent. A `workflow_dispatch` run and a `--dry-run` send nothing. If `SLACK_WEBHOOK_URL` is not set or the call fails, the run stays red and a `::warning::` says the PO was not notified. The webhook is used only by the notify step (`python -m headless_pr_workflow.bookkeeping_failure_notice`), which runs no PR code. The command writes its failures to `--errors-file` for that step.
+- **Command not on the default branch yet.** The job runs the default branch's code. On the PR that introduces the command, the default branch does not have it, so the job skips with a notice and exits successfully instead of failing a check on that PR.
+- **Trigger phrase.** The phrase is written only in a PR conversation comment that requests a review, by `/implement` or by this job (`AGENTS.md` → Codex Review Requests).
+
+`/review` remains the path for `executor:codex` stories and for a separate-session review (path 2).
+
+**Review path for `executor:codex` stories.** The local Codex worker implements and hands off the PR; no Codex review request is posted for it. The dispatcher starts one Claude `/review` (path 2) on each PR head. Blockers send the story back to `In implementation`, where the worker runs a bounded fix round on the same PR and branch; the new head gets its own `/review`. A review of the current head with no blockers leaves the PR in the merge step through the usual merge gates (the board writer shows `Mergeable`). The rounds are bounded by `CODEX_FIX_ROUND_MAX` (default `3`): above it the worker starts nothing and declares one `Type: resource` blocker, and Claude never takes over the implementation or the fix round. The cycle and its configuration are in [DISPATCHER-CONFIG.md → Codex review and fix-round cycle](DISPATCHER-CONFIG.md#codex-review-and-fix-round-cycle); `tests/test_codex_review_fix_cycle.py` runs it end to end.
+
+## Human Attention Is Pulled, Not Polled
+
+**Human attention is pulled, not polled.** The workflow must never require the Human Approver to poll for state. Every point where work requires human judgment:
+
+1. is a **named escalation type**, not an undefined "the agent got stuck" — the five blocker types in `docs/PROJECT-STATUS.md` → Blocker types, plus the notification events of Epic #160 (closure confirmation, Red flow health, reached usage limit, item ready for refinement);
+2. is delivered as an **actionable notification**, and a failed delivery is an error, not silently dropped;
+3. contains **enough to decide** without opening a session: the question, the options, the agent's recommendation, the consequences, and what is blocked;
+4. is resolved by a **decision recorded in GitHub** that the workflow picks up without further manual steps.
+
+Notifications are the doorbell; GitHub is the record.
+
+Where each clause is put into practice, and its state at implementation (2026-10-31):
+
+| Clause | Put into practice by | State |
+|---|---|---|
+| 1 Named escalation type | `docs/PROJECT-STATUS.md` → Blocker types; Epic #160 human touchpoints | in place |
+| 2 Actionable notification; failed delivery is an error | Feature #270 (Notification reliability) | gap — tracked in #270 |
+| 3 Enough to decide | `docs/PROJECT-STATUS.md` → decision-blocker fields (Question, Options, Recommendation); Feature #267 | partly in place — tracked in #267 |
+| 4 Decision recorded in GitHub, picked up without manual steps | `/unblock` resume (#262, in place); Feature #267 | partly in place — tracked in #267 |
+
+A clause marked as a gap or partly in place is still the rule. New work must not widen the gap, and the linked issue closes it.
+
+## Deterministic Automation
+
+Scripts should cover facts and gates that can be determined mechanically:
+
+- Current PR head SHA.
+- Latest relevant approval SHA.
+- Whether new commits exist after approval.
+- CI/check status for the current SHA.
+- Unresolved review threads.
+- Target branch policy.
+- Merge ownership.
+- Worktree and branch hygiene.
+
+Humans and assistants should focus on interpretation, architecture, UX, product judgment, risk assessment, and decisions that cannot be reduced to deterministic checks.
+
+## Refinement Pipeline
+
+Issue refinement follows the rolling, just-in-time strategy defined in [`REFINEMENT-PIPELINE.md`](REFINEMENT-PIPELINE.md). That document specifies buffer targets, the usage-feedback loop, parent-linking requirements, and escalation triggers.
+
+## Extension Model
+
+Core workflow policy defines what must be true. Adapters define how a specific repo or assistant satisfies optional local conventions.
+
+- Core workflow is reusable across repositories.
+- Repo adapters encode project-specific checks.
+- Assistant adapters encode optional prompt and session conventions.
+- No adapter may weaken core approval, review separation, or merge policy.

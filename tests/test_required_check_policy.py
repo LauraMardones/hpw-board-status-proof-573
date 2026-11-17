@@ -1,0 +1,247 @@
+import importlib.util
+import json
+import shutil
+import sys
+import uuid
+from importlib.machinery import SourceFileLoader
+from contextlib import contextmanager
+from pathlib import Path
+
+import pytest
+
+from headless_pr_workflow.github import RequiredStatusChecks
+from headless_pr_workflow.required_check_policy import apply_required_check_policy, load_required_check_policy
+
+from tests.github_scenarios import build_check
+
+
+@contextmanager
+def temp_repo_root():
+    repo_root = Path.cwd() / ".pytest-policy-tmp" / f"hpw-required-policy-{uuid.uuid4().hex}"
+    repo_root.mkdir(parents=True)
+    try:
+        yield repo_root
+    finally:
+        # Remove only this test's directory: under pytest-xdist other workers keep
+        # their own children of the shared parent. rmdir succeeds only once it is empty.
+        shutil.rmtree(repo_root, ignore_errors=True)
+        try:
+            repo_root.parent.rmdir()
+        except OSError:
+            pass
+
+
+def write_policy(repo_root, ci_workflows="present_non_required", required_status_checks="absent"):
+    policy_path = repo_root / "docs" / "required-check-policy.json"
+    policy_path.parent.mkdir(exist_ok=True)
+    policy_path.write_text(
+        json.dumps(
+            {
+                "schema": "headless-pr-workflow.required-check-policy.v1",
+                "branches": {
+                    "main": {
+                        "required_status_checks": required_status_checks,
+                        "ci_workflows": ci_workflows,
+                        "source": "docs/MERGE-POLICY.md#main-required-check-policy",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_load_required_check_policy_reads_structured_branch_policy():
+    with temp_repo_root() as repo_root:
+        write_policy(repo_root)
+
+        policies = load_required_check_policy(repo_root=repo_root)
+
+    assert policies["main"].declares_no_ci_required_checks is True
+    assert policies["main"].source == "docs/MERGE-POLICY.md#main-required-check-policy"
+
+
+def test_policy_absent_applies_to_unavailable_checks_with_no_workflows():
+    with temp_repo_root() as repo_root:
+        write_policy(repo_root)
+
+        required = apply_required_check_policy(
+            RequiredStatusChecks(names=(), status="unavailable", message="Not Found"),
+            branch="main",
+            status_checks=(),
+            repo_root=repo_root,
+        )
+
+    assert required.status == "policy_absent"
+    assert required.names == ()
+    assert required.source == "docs/MERGE-POLICY.md#main-required-check-policy"
+
+
+def test_policy_does_not_mask_configured_required_checks():
+    with temp_repo_root() as repo_root:
+        write_policy(repo_root)
+        original = RequiredStatusChecks(names=("unit",), status="configured")
+
+        required = apply_required_check_policy(original, branch="main", status_checks=(), repo_root=repo_root)
+
+    assert required is original
+
+
+def test_policy_required_status_checks_defers_to_live_configured_status():
+    """Regression: a 'required' policy value must never mask GitHub's live required-check status."""
+    with temp_repo_root() as repo_root:
+        write_policy(repo_root, ci_workflows="present_required", required_status_checks="required")
+        original = RequiredStatusChecks(names=("pytest",), status="configured")
+
+        required = apply_required_check_policy(original, branch="main", status_checks=(), repo_root=repo_root)
+
+    assert required is original
+
+
+def test_policy_required_status_checks_does_not_fabricate_absence_when_unavailable():
+    """Regression: a 'required' policy value must not substitute policy_absent when GitHub data is unavailable."""
+    with temp_repo_root() as repo_root:
+        write_policy(repo_root, ci_workflows="present_required", required_status_checks="required")
+        original = RequiredStatusChecks(names=(), status="unavailable", message="Not Found")
+
+        required = apply_required_check_policy(original, branch="main", status_checks=(), repo_root=repo_root)
+
+    assert required is original
+
+
+@pytest.mark.parametrize("status", ["not_configured", "configured"])
+def test_policy_required_status_checks_flags_github_reporting_no_required_checks(status):
+    """A 'required' policy must not accept GitHub reporting zero required checks as merge-ready."""
+    with temp_repo_root() as repo_root:
+        write_policy(repo_root, ci_workflows="present_required", required_status_checks="required")
+        original = RequiredStatusChecks(names=(), status=status)
+
+        required = apply_required_check_policy(original, branch="main", status_checks=(), repo_root=repo_root)
+
+    assert required.status == "policy_required_unconfigured"
+    assert required.names == ()
+    assert required.source == "docs/MERGE-POLICY.md#main-required-check-policy"
+
+
+@pytest.mark.parametrize(
+    ("required_status_checks", "ci_workflows"),
+    [
+        ("absent", "present_required"),
+        ("required", "present_non_required"),
+        ("required", "absent"),
+        ("", "present_non_required"),
+        ("absent", "unknown"),
+    ],
+)
+@pytest.mark.parametrize("status", ["not_configured", "unavailable"])
+def test_policy_flags_inconsistent_policy_when_consulted(required_status_checks, ci_workflows, status):
+    """Mismatched or unknown policy values fail closed, matching merge-gate-summary's inconsistent-policy."""
+    with temp_repo_root() as repo_root:
+        write_policy(repo_root, ci_workflows=ci_workflows, required_status_checks=required_status_checks)
+        original = RequiredStatusChecks(names=(), status=status)
+
+        required = apply_required_check_policy(original, branch="main", status_checks=(), repo_root=repo_root)
+
+    assert required.status == "policy_inconsistent"
+    assert required.names == ()
+
+
+def test_policy_does_not_consult_policy_when_github_reports_configured_names():
+    with temp_repo_root() as repo_root:
+        write_policy(repo_root, ci_workflows="present_required", required_status_checks="absent")
+        original = RequiredStatusChecks(names=("pytest",), status="configured")
+
+        required = apply_required_check_policy(original, branch="main", status_checks=(), repo_root=repo_root)
+
+    assert required is original
+
+
+def test_policy_does_not_mask_reported_failing_pending_or_unknown_checks():
+    with temp_repo_root() as repo_root:
+        write_policy(repo_root)
+        checks = (
+            build_check(name="unit", bucket="failure"),
+            build_check(name="lint", bucket="pending"),
+            build_check(name="security", bucket="unknown"),
+        )
+        original = RequiredStatusChecks(names=(), status="unavailable", message="Not Found")
+
+        required = apply_required_check_policy(original, branch="main", status_checks=checks, repo_root=repo_root)
+
+    assert required is original
+
+
+def test_policy_applies_when_non_required_workflows_exist():
+    with temp_repo_root() as repo_root:
+        write_policy(repo_root, ci_workflows="present_non_required")
+        workflows = repo_root / ".github" / "workflows"
+        workflows.mkdir(parents=True)
+        (workflows / "dispatcher.yml").write_text("name: dispatcher\n", encoding="utf-8")
+        original = RequiredStatusChecks(names=(), status="unavailable", message="Not Found")
+
+        required = apply_required_check_policy(original, branch="main", status_checks=(), repo_root=repo_root)
+
+    assert required.status == "policy_absent"
+
+
+def test_policy_does_not_apply_when_ci_workflows_absent_but_workflows_exist():
+    with temp_repo_root() as repo_root:
+        write_policy(repo_root, ci_workflows="absent")
+        workflows = repo_root / ".github" / "workflows"
+        workflows.mkdir(parents=True)
+        (workflows / "ci.yml").write_text("name: ci\n", encoding="utf-8")
+        original = RequiredStatusChecks(names=(), status="unavailable", message="Not Found")
+
+        required = apply_required_check_policy(original, branch="main", status_checks=(), repo_root=repo_root)
+
+    assert required is original
+
+
+def test_missing_policy_keeps_unavailable_required_check_data():
+    with temp_repo_root() as repo_root:
+        original = RequiredStatusChecks(names=(), status="unavailable", message="Not Found")
+
+        required = apply_required_check_policy(original, branch="main", status_checks=(), repo_root=repo_root)
+
+    assert required is original
+
+
+def test_policy_ci_workflows_not_absent_when_workflows_exist_on_main():
+    """Regression: policy file must not declare ci_workflows 'absent' when .github/workflows has files."""
+    repo_root = Path(__file__).parent.parent
+    workflow_dir = repo_root / ".github" / "workflows"
+    workflows_present = workflow_dir.exists() and any(
+        p.is_file() and p.suffix.lower() in {".yml", ".yaml"} for p in workflow_dir.iterdir()
+    )
+    if not workflows_present:
+        return  # nothing to assert when no workflows exist
+
+    policies = load_required_check_policy(repo_root=repo_root)
+    assert "main" in policies, "Policy for main must be defined when workflows exist"
+    assert policies["main"].ci_workflows != "absent", (
+        "docs/required-check-policy.json declares ci_workflows 'absent' but workflow files exist "
+        "in .github/workflows — update ci_workflows to 'present_non_required' or the correct value"
+    )
+
+
+def test_live_main_policy_requires_pytest_and_merge_gate_reads_present_required():
+    # Reads the live file directly, so the autouse pin in conftest.py does not apply.
+    repo_root = Path(__file__).resolve().parents[1]
+    raw = json.loads((repo_root / "docs" / "required-check-policy.json").read_text(encoding="utf-8"))
+
+    main = raw["branches"]["main"]
+    assert raw["schema"] == "headless-pr-workflow.required-check-policy.v1"
+    assert main["required_status_checks"] == "required"
+    assert main["ci_workflows"] == "present_required"
+    assert main["source"] == "docs/MERGE-POLICY.md#main-required-check-policy"
+    assert "pytest" in main["rationale"]
+
+    script = repo_root / "scripts" / "merge-gate-summary"
+    loader = SourceFileLoader("merge_gate_summary_live_policy", str(script))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+
+    assert module._policy_for_branch("main") == ("pass(present_required)", "present_required")

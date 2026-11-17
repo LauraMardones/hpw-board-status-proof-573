@@ -1,0 +1,133 @@
+# Roles
+
+Roles describe responsibilities in the workflow. A role may be performed by a human, an assistant, or a script, but role separation rules still apply.
+
+## Implementer
+
+The implementer changes code, docs, tests, configuration, or other repo content for a PR.
+
+Responsibilities:
+
+- Start from fresh GitHub PR context.
+- Keep local worktree state disposable.
+- Push implementation commits to the PR branch.
+- Run deterministic readiness checks before requesting review.
+- Respond to blockers by creating a new implementation head SHA.
+- Avoid reviewing or approving the same head SHA implemented in the same session.
+
+## Reviewer
+
+The reviewer evaluates a specific PR head SHA.
+
+Responsibilities:
+
+- Refresh PR context from GitHub before review.
+- Identify correctness, safety, architecture, UX, test, and maintainability risks.
+- Record blockers in GitHub review comments, review threads, or checks.
+- Approve only the specific head SHA reviewed.
+- Re-review if implementation commits change the head SHA after approval.
+
+Independent review evidence (`MERGE-POLICY.md` → Approval Gate: Independent Review):
+
+- A reviewer is independent when it is not the provider or session that implemented the head SHA. A clean Codex review counts for a Claude-implemented story; a separate review session counts when it names its provider and that provider did not implement the PR.
+- A separate review session records a GitHub review summary for the current head SHA stating that no blockers remain, naming the reviewing provider on a `Reviewer provider:` line, and stating that the review is the approval to rely on for that SHA. Use a formal approval instead when GitHub allows it.
+- Do not treat approval evidence as permission to skip CI, unresolved blocker cleanup, or the Ready for review transition.
+
+## Merge Owner
+
+The merge owner performs the final merge action for an approved PR head SHA.
+
+Responsibilities:
+
+- Confirm the current head SHA matches the approved head SHA.
+- Confirm merge ownership according to `MERGE-POLICY.md`.
+- Run a fresh pre-merge check immediately before merging.
+- Merge only through GitHub or a GitHub-backed command.
+- Perform or trigger post-merge sync and cleanup.
+
+Approval evidence:
+
+- Rely on a clean Codex review, a separate-session review summary or a formal approval only when the approval gate reports it as accepted for the current head SHA.
+- Still require a fresh GitHub refresh, a matching current head SHA, and passing merge gates before merging.
+
+## Analyst
+
+The Analyst works with the product owner in the specification phase (planning, analysis and design) through `/spec`. It is an interactive LLM session, never autonomous.
+
+Responsibilities:
+
+- Challenge the product idea and read the codebase and existing decisions.
+- Create the Epic issue once the product owner decides to pursue the idea.
+- Write `spec.md` and `plan.md` and check them against the Definition of Ready in `specs/README.md` and the accepted ADRs.
+- Open the spec PR with `Refs #<number>`.
+- Never make product decisions on the product owner's behalf; record the product owner's decisions with their rejected alternatives.
+
+## Tech Lead
+
+The Tech Lead (formerly called the orchestrator) coordinates state across issues, PRs, sessions, assistants, and loops. It has two parts: a scheduler script that chooses the next action, and refinement sessions that break work down (ADR-009, ADR-010).
+
+Responsibilities:
+
+- Select next action from GitHub state.
+- Route work to implementation, review, adapter, or human decision paths.
+- Preserve handoff context when work moves across sessions.
+- Avoid treating any local session as authoritative.
+
+## Adapter Author
+
+The adapter author maintains optional repo or assistant integrations.
+
+Responsibilities:
+
+- Keep adapters subordinate to core policy.
+- Clearly label adapter-specific assumptions.
+- Provide deterministic checks where possible.
+- Avoid encoding product-specific rules in core workflow scripts.
+
+## Human Approver
+
+A human approver supplies judgment that should not be automated away. This role is triggered by AI escalation — the Human Approver is not part of the normal code review flow and does not perform code review.
+
+Responsibilities:
+
+- Approve product, risk, design, legal, or release decisions when required.
+- Resolve ambiguous policy conflicts.
+- Decide whether an adapter-specific gate is required for a repo.
+
+Note: Code review is explicitly not part of this role. The Human Approver acts when an AI assistant escalates a decision that should not be automated — not because they are positioned in the review flow.
+
+An escalation to the Human Approver must guarantee what [Human Attention Is Pulled, Not Polled](HEADLESS-PR-WORKFLOW.md#human-attention-is-pulled-not-polled) requires: a named escalation type, an actionable notification, enough to decide, and a decision recorded in GitHub.
+
+## Product Validator
+
+The product validator tests the delivered product through actual usage and feeds findings back into the workflow as first-class inputs.
+
+Responsibilities:
+
+- Test the delivered product through actual usage after implementation is complete.
+- Post usage findings as GitHub comments on the relevant issue or PR.
+- Distinguish usage feedback from implementation blockers when reporting.
+
+Usage findings posted by the Product Validator carry the same weight as review blockers: they are valid workflow inputs that must be addressed before a story can close. The Product Validator is not a code reviewer and does not evaluate the implementation at the code level.
+
+## Worked Solo-Maintainer Flow
+
+Note: In a solo-maintainer setup, the product owner holds both the Human Approver and Product Validator roles simultaneously.
+
+Implementation session responsibilities:
+
+- Produce the candidate changes and push the reviewable head SHA.
+- Request review from a separate session instead of self-approving.
+- If blockers are found, address them by pushing a new head SHA and requesting another review.
+
+Review session responsibilities:
+
+- Refresh GitHub state before reviewing so the exact current head SHA is known.
+- Record blockers on GitHub, or record a no-blockers review summary for that SHA.
+- For a no-blockers result, use the separate-session review summary required by `MERGE-POLICY.md`, including the `Reviewer provider:` line, or a formal approval when GitHub allows it. Generate the summary text with `hpw review-evidence-text`; do not compose it.
+
+Merge-owner responsibilities:
+
+- Refresh GitHub again immediately before merge.
+- Confirm the reviewed SHA still matches the current PR head SHA.
+- Run fresh merge gates such as `pre-merge`; approval evidence does not bypass checks or stale-state protection.

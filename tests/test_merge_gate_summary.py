@@ -1,0 +1,431 @@
+from __future__ import annotations
+
+import importlib.util
+from importlib.machinery import SourceFileLoader
+import os
+import re
+import subprocess
+import sys
+from dataclasses import replace
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from headless_pr_workflow.github import GHCommandError, RequiredStatusChecks
+from tests.github_scenarios import (
+    CODEX_USAGE_LIMIT_BODY,
+    HEAD_SHA,
+    codex_comment,
+    codex_pr_378_clean_receipt_body,
+    commit_event,
+    scenario_codex_review,
+    scenario_current_approval,
+    scenario_separate_session_review,
+    scenario_stale_approval,
+)
+
+
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPT = ROOT / "scripts" / "merge-gate-summary"
+
+
+@pytest.fixture
+def module():
+    loader = SourceFileLoader("merge_gate_summary", str(SCRIPT))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    assert spec and spec.loader
+    loaded = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = loaded
+    spec.loader.exec_module(loaded)
+    return loaded
+
+
+def passing_context():
+    return replace(
+        scenario_current_approval(head_sha="abcdef1234567890"),
+        state="OPEN",
+        is_draft=False,
+        base_ref_name="main",
+        mergeable="MERGEABLE",
+    )
+
+
+def arrange_live(monkeypatch, module, *, context=None, threads=0, policy=("pass(present_non_required)", "present_non_required")):
+    context = context or passing_context()
+    monkeypatch.setattr(module, "_resolve_base_repository", lambda repo: repo or "owner/base")
+    monkeypatch.setattr(module, "fetch_pr_context", lambda target, repo=None: context)
+    monkeypatch.setattr(module, "fetch_repo_default_branch", lambda repo=None: "main")
+    monkeypatch.setattr(module, "_policy_for_branch", lambda branch: policy)
+    monkeypatch.setattr(
+        module,
+        "fetch_required_status_check_context",
+        lambda repo, branch: RequiredStatusChecks(names=(), status="unavailable"),
+    )
+    monkeypatch.setattr(module, "fetch_review_threads_for_context", lambda context, repo=None: ())
+    monkeypatch.setattr(
+        module,
+        "summarize_review_threads",
+        lambda context, raw: SimpleNamespace(unresolved_blocking_threads=tuple(range(threads))),
+    )
+    return context
+
+
+def test_dry_run_exact_output_and_no_gh_call(tmp_path):
+    fake_gh = tmp_path / ("gh.bat" if os.name == "nt" else "gh")
+    fake_gh.write_text("exit 99\n", encoding="utf-8")
+    if os.name != "nt":
+        fake_gh.chmod(0o755)
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT), "--pr", "1", "--dry-run"],
+        text=True,
+        capture_output=True,
+        env={**os.environ, "PATH": str(tmp_path)},
+        check=False,
+    )
+    assert result.returncode == 0
+    assert result.stdout == (
+        "Merge gate: policy=pass(present_non_required), checks=absent-ok, "
+        "approval=separate-session, threads=none, mergeable=yes, head=b607aa9\n"
+    )
+    assert result.stderr == ""
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "1.0", "abc", "01"])
+def test_pr_must_be_positive_integer(value):
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT), "--pr", value, "--dry-run"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert "positive integer" in result.stderr
+
+
+def test_repo_must_use_owner_repo_format():
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT), "--pr", "1", "--repo", "invalid", "--dry-run"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 2
+    assert "owner/repo" in result.stderr
+
+
+def test_all_pass_has_fixed_field_order(monkeypatch, module, capsys):
+    arrange_live(monkeypatch, module)
+    assert module.main(["--pr", "12", "--repo", "owner/repo"]) == 0
+    assert capsys.readouterr().out == (
+        "Merge gate: policy=pass(present_non_required), checks=absent-ok, "
+        "approval=formal, threads=none, mergeable=yes, head=abcdef1\n"
+    )
+
+
+def test_cross_repository_pr_uses_base_repo_for_every_lookup(monkeypatch, module):
+    context = replace(
+        passing_context(),
+        head_repository="contributor/fork",
+        is_cross_repository=True,
+    )
+    calls = []
+    monkeypatch.setattr(module, "_resolve_base_repository", lambda repo: "owner/base")
+    monkeypatch.setattr(
+        module,
+        "fetch_pr_context",
+        lambda target, repo=None: calls.append(("context", repo)) or context,
+    )
+    monkeypatch.setattr(
+        module,
+        "fetch_repo_default_branch",
+        lambda repo=None: calls.append(("default", repo)) or "main",
+    )
+    monkeypatch.setattr(module, "_policy_for_branch", lambda branch: ("pass(present_non_required)", "present_non_required"))
+    monkeypatch.setattr(
+        module,
+        "fetch_required_status_check_context",
+        lambda repo, branch: calls.append(("protection", repo))
+        or RequiredStatusChecks(names=(), status="unavailable"),
+    )
+    monkeypatch.setattr(
+        module,
+        "fetch_review_threads_for_context",
+        lambda context, repo=None: calls.append(("threads", repo)) or (),
+    )
+    monkeypatch.setattr(
+        module,
+        "summarize_review_threads",
+        lambda context, raw: SimpleNamespace(unresolved_blocking_threads=()),
+    )
+
+    assert module.evaluate(12, None).passed
+    assert calls == [
+        ("context", "owner/base"),
+        ("default", "owner/base"),
+        ("protection", "owner/base"),
+        ("threads", "owner/base"),
+    ]
+    assert all(repo != "contributor/fork" for _, repo in calls)
+
+
+def test_explicit_repo_needs_no_resolution_subprocess(monkeypatch, module):
+    def unexpected(*args, **kwargs):
+        raise AssertionError("gh repo view must not run for explicit --repo")
+
+    monkeypatch.setattr(module.subprocess, "run", unexpected)
+    assert module._resolve_base_repository("owner/base") == "owner/base"
+
+
+def test_unresolved_threads_block(monkeypatch, module, capsys):
+    arrange_live(monkeypatch, module, threads=2)
+    assert module.main(["--pr", "12"]) == 1
+    assert "threads=fail(2)" in capsys.readouterr().out
+
+
+def test_stale_approval_blocks(monkeypatch, module, capsys):
+    context = replace(
+        scenario_stale_approval(head_sha="abcdef1234", approval_sha="1234567dead"),
+        state="OPEN",
+        is_draft=False,
+        base_ref_name="main",
+        mergeable="MERGEABLE",
+    )
+    arrange_live(monkeypatch, module, context=context)
+    assert module.main(["--pr", "12"]) == 1
+    assert "approval=fail(stale)" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("change", "expected"),
+    [
+        ({"state": "CLOSED"}, "fail(not-open)"),
+        ({"is_draft": True}, "fail(draft)"),
+        ({"base_ref_name": "develop"}, "fail(wrong-base)"),
+        ({"mergeable": "CONFLICTING"}, "fail(conflicting)"),
+        ({"mergeable": "UNKNOWN"}, "warn(unknown)"),
+    ],
+)
+def test_mergeability_failures(monkeypatch, module, capsys, change, expected):
+    arrange_live(monkeypatch, module, context=replace(passing_context(), **change))
+    assert module.main(["--pr", "12"]) == 1
+    assert f"mergeable={expected}" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("buckets", "expected"),
+    [
+        ({"failure"}, "fail(failing)"),
+        ({"pending"}, "fail(pending)"),
+        ({"unknown"}, "warn(unknown)"),
+    ],
+)
+def test_check_failures(module, buckets, expected):
+    context = SimpleNamespace(status_checks=tuple(SimpleNamespace(bucket=b, name=b) for b in buckets))
+    required = RequiredStatusChecks(names=(), status="available")
+    assert module._checks_value(context, required, "present_non_required") == expected
+
+
+def test_missing_required_check_blocks(module):
+    context = SimpleNamespace(status_checks=())
+    required = RequiredStatusChecks(names=("unit",), status="available")
+    assert module._checks_value(context, required, "present_non_required") == "fail(missing-required)"
+
+
+def test_malformed_policy_blocks(module, tmp_path):
+    policy = tmp_path / "docs" / "required-check-policy.json"
+    policy.parent.mkdir()
+    policy.write_text("not json", encoding="utf-8")
+    assert module._policy_for_branch("main", repo_root=tmp_path) == ("fail(malformed-policy)", None)
+
+
+def test_policy_rejects_workflow_mismatch(module, tmp_path):
+    policy = tmp_path / "docs" / "required-check-policy.json"
+    policy.parent.mkdir()
+    policy.write_text(
+        '{"schema":"headless-pr-workflow.required-check-policy.v1",'
+        '"branches":{"main":{"required_status_checks":"absent","ci_workflows":"absent"}}}',
+        encoding="utf-8",
+    )
+    workflows = tmp_path / ".github" / "workflows"
+    workflows.mkdir(parents=True)
+    (workflows / "ci.yml").write_text("name: CI", encoding="utf-8")
+    assert module._policy_for_branch("main", repo_root=tmp_path) == ("fail(workflows-present)", None)
+
+
+def test_policy_accepts_required_status_checks_with_workflows_present(module, tmp_path):
+    policy = tmp_path / "docs" / "required-check-policy.json"
+    policy.parent.mkdir()
+    policy.write_text(
+        '{"schema":"headless-pr-workflow.required-check-policy.v1",'
+        '"branches":{"main":{"required_status_checks":"required","ci_workflows":"present_required"}}}',
+        encoding="utf-8",
+    )
+    workflows = tmp_path / ".github" / "workflows"
+    workflows.mkdir(parents=True)
+    (workflows / "tests.yml").write_text("name: tests", encoding="utf-8")
+    assert module._policy_for_branch("main", repo_root=tmp_path) == ("pass(present_required)", "present_required")
+
+
+def test_policy_required_status_checks_without_workflow_files_is_missing(module, tmp_path):
+    policy = tmp_path / "docs" / "required-check-policy.json"
+    policy.parent.mkdir()
+    policy.write_text(
+        '{"schema":"headless-pr-workflow.required-check-policy.v1",'
+        '"branches":{"main":{"required_status_checks":"required","ci_workflows":"present_required"}}}',
+        encoding="utf-8",
+    )
+    assert module._policy_for_branch("main", repo_root=tmp_path) == ("fail(workflows-missing)", None)
+
+
+@pytest.mark.parametrize(
+    ("required", "workflows"),
+    [
+        ("required", "present_non_required"),
+        ("absent", "present_required"),
+    ],
+)
+def test_policy_rejects_unpaired_required_values(module, tmp_path, required, workflows):
+    policy = tmp_path / "docs" / "required-check-policy.json"
+    policy.parent.mkdir()
+    policy.write_text(
+        '{"schema":"headless-pr-workflow.required-check-policy.v1",'
+        f'"branches":{{"main":{{"required_status_checks":"{required}","ci_workflows":"{workflows}"}}}}}}',
+        encoding="utf-8",
+    )
+    workflow_dir = tmp_path / ".github" / "workflows"
+    workflow_dir.mkdir(parents=True)
+    (workflow_dir / "tests.yml").write_text("name: tests", encoding="utf-8")
+    assert module._policy_for_branch("main", repo_root=tmp_path) == ("fail(inconsistent-policy)", None)
+
+
+REQUIRED_POLICY = ("pass(present_required)", "present_required")
+
+
+def test_required_policy_blocks_unavailable_required_checks_with_empty_rollup(monkeypatch, module, capsys):
+    arrange_live(monkeypatch, module, context=replace(passing_context(), status_checks=()), policy=REQUIRED_POLICY)
+    assert module.main(["--pr", "12"]) == 1
+    assert "checks=fail(required-unavailable)" in capsys.readouterr().out
+
+
+def test_required_policy_blocks_unavailable_required_checks_with_passing_rollup(module):
+    context = SimpleNamespace(status_checks=(SimpleNamespace(bucket="success", name="lint"),))
+    required = RequiredStatusChecks(names=(), status="unavailable")
+    assert module._checks_value(context, required, "present_required") == "fail(required-unavailable)"
+
+
+def test_required_policy_blocks_when_github_reports_no_required_checks(module):
+    context = SimpleNamespace(status_checks=(SimpleNamespace(bucket="success", name="lint"),))
+    required = RequiredStatusChecks(names=(), status="not_configured")
+    assert module._checks_value(context, required, "present_required") == "fail(required-unconfigured)"
+
+
+@pytest.mark.parametrize(
+    ("checks", "expected"),
+    [
+        ((), "fail(missing-required)"),
+        ((SimpleNamespace(bucket="pending", name="pytest"),), "fail(pending)"),
+        ((SimpleNamespace(bucket="failure", name="pytest"),), "fail(failing)"),
+        ((SimpleNamespace(bucket="success", name="pytest"),), "pass"),
+    ],
+)
+def test_required_policy_defers_to_configured_required_checks(module, checks, expected):
+    context = SimpleNamespace(status_checks=checks)
+    required = RequiredStatusChecks(names=("pytest",), status="configured")
+    assert module._checks_value(context, required, "present_required") == expected
+
+
+def test_thread_fetch_failure_is_non_passing(monkeypatch, module, capsys):
+    arrange_live(monkeypatch, module)
+    monkeypatch.setattr(
+        module,
+        "fetch_review_threads_for_context",
+        lambda context, repo=None: (_ for _ in ()).throw(GHCommandError(["gh"], 1, "denied")),
+    )
+    assert module.main(["--pr", "12"]) == 1
+    assert "threads=warn(unavailable)" in capsys.readouterr().out
+
+
+def test_pr_fetch_failure_is_usage_error(monkeypatch, module, capsys):
+    monkeypatch.setattr(module, "_resolve_base_repository", lambda repo: repo or "owner/base")
+    monkeypatch.setattr(
+        module,
+        "fetch_pr_context",
+        lambda target, repo=None: (_ for _ in ()).throw(GHCommandError(["gh"], 1, "not found")),
+    )
+    assert module.main(["--pr", "404"]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "GitHub CLI failed" in captured.err
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows does not use POSIX executable mode")
+def test_script_is_executable():
+    assert SCRIPT.stat().st_mode & 0o111 == 0o111
+
+
+def test_dry_run_sample_line_is_a_passing_gate(module):
+    match = re.fullmatch(
+        r"Merge gate: policy=(.+), checks=(.+), approval=(.+), threads=(.+), mergeable=(.+), head=(.+)",
+        module.DRY_RUN_LINE,
+    )
+    assert match
+    assert module.GateResult(*match.groups()).passed is True
+
+
+@pytest.mark.parametrize(
+    ("context", "approval"),
+    [
+        (scenario_current_approval(head_sha="abcdef1234567890"), "formal"),
+        (scenario_codex_review(), "codex-review"),
+        (
+            scenario_codex_review(
+                timeline=(commit_event(HEAD_SHA), codex_comment(codex_pr_378_clean_receipt_body(HEAD_SHA[:10]))),
+            ),
+            "codex-review",
+        ),
+        (scenario_separate_session_review(head_sha="abcdef1234567890"), "separate-session"),
+    ],
+)
+def test_merge_gate_line_names_the_approval_source(monkeypatch, module, capsys, context, approval):
+    arrange_live(monkeypatch, module, context=context)
+
+    assert module.main(["--pr", "12", "--repo", "owner/repo"]) == 0
+    assert capsys.readouterr().out == (
+        "Merge gate: policy=pass(present_non_required), checks=absent-ok, "
+        f"approval={approval}, threads=none, mergeable=yes, head={context.head_ref_oid[:7]}\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "context",
+    [
+        pytest.param(scenario_codex_review(linked_issues=()), id="storyless-codex-review"),
+        pytest.param(
+            scenario_codex_review(timeline=(commit_event(HEAD_SHA), codex_comment(CODEX_USAGE_LIMIT_BODY))),
+            id="usage-limit-reply",
+        ),
+        pytest.param(
+            scenario_separate_session_review(head_sha="abcdef1234567890", reviewer_provider=None),
+            id="separate-session-review-without-provider",
+        ),
+    ],
+)
+def test_merge_gate_fails_when_a_recognizer_rejects_the_evidence(monkeypatch, module, capsys, context):
+    arrange_live(monkeypatch, module, context=context)
+
+    assert module.main(["--pr", "12", "--repo", "owner/repo"]) == 1
+    assert "approval=fail(missing-or-blocked)" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("approval", ["formal", "codex-review", "separate-session"])
+def test_gate_result_accepts_each_passing_approval_value(module, approval):
+    result = module.GateResult("pass(absent)", "pass", approval, "none", "yes", "abcdef1")
+    assert result.passed is True
+
+
+@pytest.mark.parametrize("approval", ["solo-maintainer", "fail(stale)", "fail(missing-or-blocked)", "warn(unknown-source)"])
+def test_gate_result_rejects_every_other_approval_value(module, approval):
+    result = module.GateResult("pass(absent)", "pass", approval, "none", "yes", "abcdef1")
+    assert result.passed is False

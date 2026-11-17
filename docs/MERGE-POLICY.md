@@ -1,0 +1,218 @@
+# Merge Policy
+
+Merge policy is normative. Adapters may add stricter gates, but they must not weaken these rules.
+
+## Required Merge Conditions
+
+A PR may be merged only when all conditions are true after a fresh GitHub refresh:
+
+- The PR is open and targets the expected base branch.
+- The current PR head SHA is known.
+- The approval gate is satisfied for the current PR head SHA (see [Approval Gate: Independent Review](#approval-gate-independent-review)).
+- No new commits were pushed after the relied-on approval evidence.
+- Required CI/checks have completed successfully for the current head SHA.
+- Blocking review threads or comments are resolved or explicitly waived according to repo policy.
+- Required manual gates are satisfied.
+- The merge owner is the session that last implemented the approved current head SHA, or an authorized human/operator acting under explicit takeover rules.
+
+## Main Required-Check Policy
+
+### `required_status_checks` values
+
+| Value | Meaning |
+|---|---|
+| `absent` | GitHub branch protection does not configure any required status checks for the branch. |
+| `required` | GitHub branch protection configures one or more required status checks for the branch. Tooling defers entirely to GitHub's live required-check status; the absent-by-policy bypass described below does not apply. |
+
+### `ci_workflows` values
+
+| Value | Meaning |
+|---|---|
+| `absent` | No GitHub Actions workflow files exist in `.github/workflows`. |
+| `present_non_required` | Workflow files exist in `.github/workflows` but none are configured as required status checks for the branch. |
+| `present_required` | Workflow files exist in `.github/workflows` and at least one is configured as a required status check for the branch. |
+
+### Required-check gate
+
+For `main` in this repository, GitHub branch protection requires the `pytest` check, so the absent-by-policy bypass does not apply to `main`. The bypass applies only to a branch whose `docs/required-check-policy.json` entry declares `required_status_checks` as `absent`, and only while all of these are true:
+
+- GitHub does not report configured required status checks for `main`, or branch-protection required-check data is unavailable for this private repository.
+- The current PR status-check rollup is empty, or every reported check is passing or skipped.
+- The machine-readable policy source in `docs/required-check-policy.json` declares `required_status_checks` as `absent` and `ci_workflows` as `absent` or `present_non_required` for `main`.
+
+When those facts are verified, `hpw ci-summary` and `hpw pre-merge` may report the required-check gate as passing because required checks are absent by explicit repository policy. Unavailable branch-protection data is not enough by itself; failing, pending, unknown, missing, or configured required checks must still block merge readiness.
+
+Non-required workflow files (i.e. `ci_workflows: "present_non_required"`) do not affect the required-check gate. Only the presence or absence of *configured required status checks* determines whether the gate passes.
+
+When `docs/required-check-policy.json` declares `required_status_checks` as `required` for a branch (set once branch protection actually configures a required check; `main` was switched when #322 merged, after branch protection began requiring `pytest`), the absent-by-policy bypass never applies for that branch. `hpw ci-summary`, `hpw pre-merge`, and `scripts/merge-gate-summary` defer to GitHub's live required-check status: a required check that is failing, pending, or has not yet reported blocks merge readiness exactly as a real GitHub-configured required check would.
+
+`required_status_checks: "required"` must be paired with `ci_workflows: "present_required"`, and `present_required` is valid only with `required`. Any other pairing, or an unknown value in either field, is an inconsistent policy and fails closed. Under a `required` policy the gate also fails closed when it cannot confirm the configured checks:
+
+| GitHub reports | `hpw ci-summary` / `hpw pre-merge` | `scripts/merge-gate-summary` |
+|---|---|---|
+| Inconsistent policy entry for the branch | `required_check_status: policy_inconsistent`, blocking, unless GitHub reports named required checks (those stay authoritative) | `policy=fail(inconsistent-policy)` in every case |
+| Required-check data unavailable | `required_check_status: unavailable`, blocking | `checks=fail(required-unavailable)` |
+| No required checks configured for the branch | `required_check_status: policy_required_unconfigured`, blocking | `checks=fail(required-unconfigured)` |
+| Configured required checks, empty status-check rollup | `required_check_status: missing`, blocking | `checks=fail(missing-required)` |
+
+A `required` policy never yields `policy_absent` or `absent-ok`. Because of the "no required checks configured" row, `docs/required-check-policy.json` must be switched to `required` only after branch protection actually requires the check; switching it earlier blocks every PR targeting that branch.
+
+## Approval Gate: Independent Review
+
+The approval gate is satisfied when a reviewer independent of the implementer found no blockers on the exact current head SHA (ADR-007). A repository with one maintainer is the normal case, not an exception: no second human approver is expected.
+
+Any one of three kinds of evidence satisfies the gate. Each is checked by script (`hpw approval-check`, `hpw pre-merge`, `scripts/merge-gate-summary`) and fails closed: evidence the recognizer cannot verify does not count.
+
+| Path | Evidence | Reported as |
+|---|---|---|
+| 1 | Clean Codex review of the current head | `approval_source: codex-review`, `approval=codex-review` |
+| 2 | Separate-session review of the current head | `approval_source: separate-session-review`, `approval=separate-session` |
+| 3 | Formal GitHub approval of the current head | `approval_source: formal`, `approval=formal` |
+
+When more than one path is valid, the first of formal, Codex review, separate-session review is reported.
+
+A blocking state wins over every path: a `CHANGES_REQUESTED` review decision, an unknown head SHA and a draft PR each block the merge even when path 1 or path 2 evidence is valid. A PR may be reviewed while draft, but no approval evidence may be relied on for merge until the PR is marked Ready for review.
+
+### Path 1: Clean Codex Review
+
+A PR conversation comment counts only when all of the following hold:
+
+- It is authored by the Codex bot: actor type `Bot` with login `chatgpt-codex-connector` (shown as `chatgpt-codex-connector[bot]` by the REST API), and it was not edited by another account.
+- It states that no major issues were found, in the known clean-result format.
+- Its "Reviewed commit" identifier is a prefix of the current head SHA and of no other commit on the PR.
+- No commit and no force-push appears after it in the PR timeline, so it was posted while the named commit was the head.
+- No newer Codex review reports findings: no later PR review submission by the Codex bot, and no later Codex bot comment that is neither a clean result nor a usage-limit reply.
+- The PR has a linked story (an issue in this repository that the PR closes), and every linked story carries exactly one `executor:` label, which is an `executor:claude-code-*` label.
+
+Path 1 fails closed, with the stated `codex_review.status`, when:
+
+| Status | Condition |
+|---|---|
+| `stale` | The named commit is not the current head, or a commit or force-push was added after the comment, even when the head SHA is again the one named. |
+| `ambiguous` | The named prefix matches more than one commit on the PR. |
+| `superseded` | A newer Codex review or comment has findings. |
+| `not-applicable` | No linked story is found, a linked story has no `executor:` label or more than one, or the linked story carries `executor:codex`. |
+| `missing` | No clean comment by the Codex bot exists. A 👍 reaction never counts, because it names no commit. Codex text quoted by a human, or posted by a `User` account with the bot's login, never counts. |
+| `invalid` | The only Codex reply is a usage-limit or error reply or has an unknown format, the bot's comment was edited by another account, or the comments, commits, timeline or linked story could not be read completely. |
+
+**A PR with no linked story cannot clear the gate through a Codex review.** Path 1 identifies the implementer from the linked story's `executor:` label, so a storyless PR must use path 2 or path 3. A PR implemented by Codex (`executor:codex`) also needs path 2 or path 3.
+
+Unresolved Codex finding threads keep blocking through the review-thread gate, independently of this path.
+
+For a Claude-implemented story, the `codex-review-bookkeeping` job resolves a Codex-opened finding thread from an older head when Codex's clean result on the current head is accepted by the approval gate and the required checks are green, and lists the thread in its Session Summary. This is a resolution on the reviewer's own later evidence, not a waiver: the merge gate is unchanged and an unresolved thread still blocks. The job never resolves a thread opened by anyone other than the Codex bot, a Codex thread from a review of the current head, or a thread whose review commit it cannot read. When such a thread remains, the job posts no Session Summary; it posts a `Type: external` blocker naming the threads (see [HEADLESS-PR-WORKFLOW.md → Codex review loop](HEADLESS-PR-WORKFLOW.md#codex-review-loop)).
+
+### Path 2: Separate-Session Review
+
+A separate-session review counts only when all conditions are true:
+
+- Review was performed in a separate session from the session that implemented the reviewed head SHA.
+- The review is recorded on GitHub against the current head SHA as a PR review submission summary (state `COMMENTED`).
+- The review summary states that no blockers remain for that exact head SHA. Automation requires all three of these phrases, matched without regard to case:
+  - `solo-maintainer override accepted`
+  - `no blockers remain for <head-sha>`, with the full 40-character head SHA
+  - `approval to rely on for the current head SHA`
+- The review summary names the reviewing provider on its own line: `Reviewer provider: claude` or `Reviewer provider: codex`. Automation requires this line too.
+- The reviewing provider is not the provider that implemented the PR, per the `executor:` label of any linked story (`executor:claude-code-*` is `claude`, `executor:codex` is `codex`). With no linked story, or a linked story with no `executor:` label, there is nothing to compare and a stated valid provider is enough.
+
+Path 2 fails closed when no reviewing provider is stated or the value is not `claude` or `codex`, when the stated provider matches the implementing provider, when the summary was recorded on an earlier head (stale), or when the linked stories could not be read completely.
+
+The marker phrases keep their earlier wording for compatibility. The sentence that no independent GitHub approver is available is no longer required.
+
+The expected GitHub evidence surface is the PR review submission summary attached to the reviewed head SHA. A top-level issue or PR conversation comment is not an equivalent surface for path 2 evidence because it is not the same SHA-bound review submission surface.
+
+When a review session determines that no blockers remain, the reviewer should mark the PR Ready for review before issuing the final review summary.
+
+Required PR review summary template. Use it verbatim, changing only `<head-sha>` and `<claude|codex>`; do not compose or paraphrase the sentences, because a summary missing any required phrase is rejected. `hpw review-evidence-text <head-sha> --reviewer-provider <claude|codex>` prints this text for a full head SHA, and `hpw approval-check` confirms after posting that the summary was accepted. Put the summary as its own block at the top of the review body, above the Session Summary.
+
+```text
+Reviewed head SHA `<head-sha>`.
+
+No blockers remain for <head-sha>.
+
+solo-maintainer override accepted.
+
+Reviewer provider: <claude|codex>
+
+This solo-maintainer override is the approval to rely on for the current head SHA.
+```
+
+Review-evidence tooling may inspect normalized review data from GraphQL surfaces such as `latestReviews` and `reviews`. Those fields are discovery surfaces for PR review submissions; references to them do not make issue comments an equivalent policy surface for path 2 evidence.
+
+### Path 3: Formal GitHub Approval
+
+A formal GitHub approval on the current head SHA satisfies the gate. A formal approval recorded on an earlier head is stale and does not count. Path 3 does not depend on the PR timeline or linked stories.
+
+A review finding the story does not own (Out of scope) is classified, not waived: a classification is not a waiver. It is one of two kinds. A waiver-kind finding (an edge case outside the story's acceptance criteria, or an Epic or Feature requirement the story did not take on) waits for the PO: Only the PO waives it, with a PR comment that names the finding and its follow-up issue; no session waives or resolves it. Waiving changes no merge gate: the thread still has to be resolved under the review-thread gate, and for a waived thread on the current head that resolution is the PO's, since no later review supersedes a same-head thread.
+
+A catch-all-kind finding (about code the PR did not add or change) needs no waiver: it gets a catch-all issue, and its thread is resolved by automation through `hpw resolve-catch-all-thread`, the second resolution path next to Path 1's superseded Codex thread. The helper resolves the thread only when fresh reads show all of these: the PR is the verified PR, is open, and its head SHA equals the `--head` the classifying session passes; the thread belongs to that PR and is unresolved; a reply after the thread's first comment starts with the two fixed lines `Classification: Out of scope — code the PR did not add or change` and `Catch-all issue: #<n>`, naming the same issue; and that issue passes the `hpw catch-all-issue link` check (open, with the catch-all `Parent epic:` and `Feature group:` lines and a `Found under:` and an `Origin:` line). It then makes one `resolveReviewThread` mutation, never retried, and reports success only when a re-read shows the thread resolved. On any failed check, failed or timed-out read, or unconfirmed mutation it resolves nothing more and exits non-zero; the thread keeps holding the PR through the review-thread gate, and the finding is handled as waiver kind for that round. The helper does not recompute the classification, which stays the session's judgement and is visible in the reply and the Session Summary.
+
+No path waives any other merge condition: required checks, unresolved review threads, draft state, mergeability and the fresh refresh before merge apply unchanged. Automation resolves a review thread in exactly two cases: a superseded Codex thread, on Codex's own later clean result (Path 1), and the thread of a catch-all-kind finding, through `hpw resolve-catch-all-thread` under the conditions above. Every other thread (a Blocker thread, a waiver-kind thread, a human's thread, a Codex thread of a Blocker) and every other merge gate is unchanged.
+
+## SHA-Bound Approval
+
+Approval is not a general property of a PR. Approval is a property of a reviewed PR head SHA.
+
+"Approval" here means whichever evidence satisfies the approval gate: a clean Codex review, a separate-session review or a formal approval.
+
+If the PR head SHA changes after approval:
+
+- Existing approval evidence must be treated as stale until re-evaluated. This holds for all three paths.
+- Merge must be blocked.
+- Review delta should be shown to the reviewer.
+- A new review must be recorded against the new head SHA: a new clean Codex review, a new separate-session review summary or a new formal approval.
+
+## Fresh GitHub Refresh
+
+Merge must never rely on stale local state.
+
+Immediately before merge, the merge owner must refresh from GitHub and verify:
+
+- PR number and repository.
+- Current head SHA.
+- Base branch.
+- Approval state.
+- Review thread state.
+- CI/check state.
+- Branch protection or mergeability state.
+
+## Merge Ownership
+
+Merge ownership belongs to the implementation session that last produced the approved head SHA. This creates a clean chain:
+
+implementation session -> pushed head SHA -> separate review session -> approval -> same implementation session may merge after fresh refresh
+
+If that session is unavailable, a takeover session may become merge owner only after:
+
+- Fetching fresh GitHub PR context.
+- Confirming no local-only state is required.
+- Recording takeover intent.
+- Re-running pre-merge checks.
+
+The initial `hpw merge-owner` implementation is intentionally conservative. It
+does not infer ownership from local chat history, branch names, or worktree
+state. The current session identity must be supplied with `--session-id` or
+`HPW_SESSION_ID`. Until durable owner recording exists, expected owner evidence
+must be supplied explicitly with `--expected-owner` or
+`HPW_EXPECTED_MERGE_OWNER`, optionally bound to the current PR head with
+`--expected-owner-sha` or `HPW_EXPECTED_MERGE_OWNER_SHA`.
+
+On a dispatcher story, a head pushed by a manual session (for example a manual fix round after `fix-round-max`) has no dispatcher owner, and the dispatcher never merges it. The PO's manual `/merge <pr>` session merges it as a Merge Takeover ([`docs/TAKEOVER-RULES.md`](TAKEOVER-RULES.md) → Merge Takeover), and its merge comment (the `Merge gate:` line and Session Summary) is the record; the PO then runs `/cleanup <pr>`.
+
+## Merge Command Behavior
+
+The merge command must:
+
+- Refuse to merge without a fresh pre-merge result.
+- Refuse to merge if the current head SHA differs from the approved SHA.
+- Refuse to merge if required CI is pending, failing, missing, or stale.
+- Refuse to merge if unresolved blockers exist.
+- Report the exact PR, head SHA, base branch, and merge method before action.
+
+## Post-Merge Requirements
+
+After merge:
+
+- Confirm merged state in GitHub.
+- Record or emit merge SHA when available.
+- Sync local base branch if a local checkout exists.
+- Mark temporary worktrees and branches as cleanup candidates.

@@ -1,0 +1,127 @@
+# Codex review bookkeeping (ADR-006, issue #292)
+#
+# Deterministic follow-up to a Codex review: post the Session Summary that hands
+# the story to merge or back to implementation, re-request a missing review
+# within bounds, or post a blocker. On a clean result it also resolves Codex's
+# own finding threads from older heads (issue #331), before the summary. It
+# writes no board status (issue #478): the dispatcher's board writer shows the
+# story's status. No model is called and no model secret is referenced.
+#
+# An event only names the PR. `hpw codex-review-bookkeeping` reads the PR fresh
+# from GitHub and decides from current facts, so a redelivered or late event is
+# a no-op, and the scheduled run makes up for any event that was missed. All
+# state lives on GitHub; nothing is kept on the runner or in a cache.
+#
+# A failed run tells the PO through Slack (issue #330): one message when a
+# failure streak starts, then at most one a day, decided from this workflow's
+# own run history. A manual run and a run that only saw a PR change under it
+# (exit code 3, a warning) send nothing. SLACK_WEBHOOK_URL is read by the notify
+# step only. See docs/HEADLESS-PR-WORKFLOW.md -> "Codex review loop".
+#
+# The job always checks out the default branch, never the PR's code.
+# See docs/HEADLESS-PR-WORKFLOW.md -> "Codex review loop".
+#
+# The job runs with the PROJECT_TOKEN secret. The scopes that token needs are
+# listed in docs/DISPATCHER-CONFIG.md -> "GitHub Token — `PROJECT_TOKEN`".
+
+name: Codex review bookkeeping
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review:
+    types: [submitted]
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number. Leave empty to run for every open, non-draft PR."
+        required: false
+        type: string
+
+# One run at a time for the repository, so a comment event and a scheduled run
+# never act on the same PR together. A queued run waits; a running one is never
+# cancelled. GitHub keeps only the newest queued run per group, which is safe
+# because every run decides from fresh state.
+concurrency:
+  group: codex-review-bookkeeping-${{ github.repository }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  bookkeeping:
+    # Event runs start only for the Codex bot's own PR comments and reviews.
+    if: >-
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'issue_comment' && github.event.issue.pull_request && github.event.comment.user.type == 'Bot' && github.event.comment.user.login == 'chatgpt-codex-connector[bot]') ||
+      (github.event_name == 'pull_request_review' && github.event.review.user.type == 'Bot' && github.event.review.user.login == 'chatgpt-codex-connector[bot]')
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.PROJECT_TOKEN }}
+
+    steps:
+      - name: Checkout default branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Event payload values reach the script only through environment variables.
+      - name: Run Codex review bookkeeping
+        env:
+          PR_NUMBER: ${{ github.event.issue.number || github.event.pull_request.number || inputs.pr_number }}
+          REPOSITORY: ${{ github.repository }}
+          ERRORS_FILE: ${{ runner.temp }}/bookkeeping-errors.json
+          CODEX_REVIEW_RETRY_HOURS: ${{ vars.CODEX_REVIEW_RETRY_HOURS }}
+          CODEX_REVIEW_MAX_REQUESTS: ${{ vars.CODEX_REVIEW_MAX_REQUESTS }}
+        # Before the command first lands on the default branch (the PR that
+        # introduces it), there is nothing to run: skip with a notice.
+        run: |
+          if [ ! -f src/headless_pr_workflow/codex_review_bookkeeping.py ]; then
+            echo "::notice::The default branch has no codex-review-bookkeeping command yet; nothing to do."
+            exit 0
+          fi
+          # A pull_request_review run uses this branch's workflow file but the
+          # default branch's hpw. Pass --errors-file only when that hpw has it.
+          if sh scripts/hpw codex-review-bookkeeping --help 2>&1 | grep -q -e '--errors-file'; then
+            set -- --errors-file "$ERRORS_FILE"
+          else
+            set --
+          fi
+          status=0
+          if [ -n "$PR_NUMBER" ]; then
+            sh scripts/hpw codex-review-bookkeeping "$PR_NUMBER" --repo "$REPOSITORY" "$@" || status=$?
+          else
+            sh scripts/hpw codex-review-bookkeeping --all --repo "$REPOSITORY" "$@" || status=$?
+          fi
+          # Exit 3: a PR changed during the run, nothing was done, the next run decides again.
+          if [ "$status" -eq 3 ]; then
+            echo "::warning::A PR changed during the run; nothing was posted or moved. The next run decides again."
+            exit 0
+          fi
+          exit "$status"
+
+      # Only after a failure, and never for a manual run.
+      - name: Notify the PO of the failure
+        if: failure() && github.event_name != 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          REPOSITORY: ${{ github.repository }}
+          ERRORS_FILE: ${{ runner.temp }}/bookkeeping-errors.json
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ ! -f src/headless_pr_workflow/bookkeeping_failure_notice.py ]; then
+            echo "::warning::The default branch has no failure notification yet; the PO was not notified."
+            exit 0
+          fi
+          PYTHONPATH=src python -m headless_pr_workflow.bookkeeping_failure_notice

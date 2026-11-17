@@ -1,0 +1,402 @@
+import pytest
+
+from headless_pr_workflow.pre_merge import summarize_pre_merge
+from headless_pr_workflow.github import RequiredStatusChecks
+from headless_pr_workflow.github.review_threads import summarize_review_threads
+
+from tests.github_scenarios import (
+    build_check,
+    build_pr_context,
+    codex_comment,
+    codex_findings_review,
+    commit_event,
+    HEAD_SHA,
+    scenario_codex_review,
+    scenario_comment_only_review,
+    scenario_current_approval,
+    scenario_dirty_merge_state,
+    scenario_draft_pr,
+    scenario_empty_status_rollup,
+    scenario_failing_checks,
+    scenario_mergeable_unknown,
+    scenario_pending_checks,
+    scenario_separate_session_review,
+    scenario_stale_approval,
+    with_context,
+)
+
+
+def review_thread(
+    *,
+    thread_id: str = "thread-1",
+    path: str = "src/app.py",
+    line: int = 10,
+    is_resolved: bool = False,
+    is_outdated: bool = False,
+) -> dict:
+    return {
+        "id": thread_id,
+        "path": path,
+        "line": line,
+        "startLine": None,
+        "isResolved": is_resolved,
+        "isOutdated": is_outdated,
+        "comments": {"totalCount": 0, "nodes": []},
+    }
+
+
+def test_pre_merge_passes_when_all_core_gates_pass():
+    summary = summarize_pre_merge(
+        scenario_current_approval(
+            head_sha="head123",
+            status_checks=(build_check(name="unit", bucket="success", status="COMPLETED", conclusion="SUCCESS"),),
+        ),
+        expected_base_ref_name="main",
+        required_check_names=("unit",),
+    )
+
+    assert summary.blocking_reasons == ()
+    assert summary.hard_gate_passed is True
+    assert all(check.ok for check in summary.checks)
+    output = summary.to_dict()
+    assert output["current_head_sha"] == "head123"
+    assert output["pr"]["number"] == 123
+    assert output["approval_review_source"]["approval_source"] == "formal"
+    assert output["target_branch_comparison"]["result"] == "pass"
+    assert output["required_check_summary"]["required_check_status"] == "satisfied"
+    assert output["mergeability_facts"]["mergeable"] == "MERGEABLE"
+    assert output["unresolved_thread_summary"]["thread_counts"]["unresolved_blocking"] == 0
+
+
+def test_pre_merge_blocks_draft_pr():
+    summary = summarize_pre_merge(
+        with_context(
+            scenario_draft_pr(head_ref_oid="head123"),
+            latest_reviews=(scenario_current_approval(head_sha="head123").latest_reviews[0],),
+        ),
+        expected_base_ref_name="main",
+        required_check_names=(),
+    )
+
+    assert "PR is draft." in summary.blocking_reasons
+    assert summary.hard_gate_passed is False
+
+
+def test_pre_merge_blocks_stale_approval():
+    summary = summarize_pre_merge(
+        scenario_stale_approval(head_sha="new-head", approval_sha="old-head"),
+        expected_base_ref_name="main",
+        required_check_names=(),
+    )
+
+    assert "formal approval is stale for the current PR head SHA" in summary.blocking_reasons
+    assert summary.hard_gate_passed is False
+
+
+def test_pre_merge_blocks_failing_and_pending_checks():
+    summary = summarize_pre_merge(
+        with_context(
+            scenario_failing_checks(head_sha="head123", check_name="unit"),
+            status_checks=(
+                build_check(name="unit", bucket="failure", status="COMPLETED", conclusion="FAILURE"),
+                build_check(name="lint", bucket="pending", state="PENDING"),
+            ),
+        ),
+        expected_base_ref_name="main",
+        required_check_names=("unit", "lint"),
+    )
+
+    assert "Status check unit is failing (status=COMPLETED, conclusion=FAILURE)." in summary.blocking_reasons
+    assert "Status check lint is pending (state=PENDING)." in summary.blocking_reasons
+    assert summary.hard_gate_passed is False
+
+
+def test_pre_merge_blocks_mergeable_unknown():
+    summary = summarize_pre_merge(
+        scenario_mergeable_unknown(head_sha="head123"),
+        expected_base_ref_name="main",
+        required_check_names=(),
+    )
+
+    assert "PR mergeable state is UNKNOWN." in summary.blocking_reasons
+    assert summary.hard_gate_passed is False
+
+
+def test_pre_merge_blocks_dirty_merge_state():
+    summary = summarize_pre_merge(
+        scenario_dirty_merge_state(head_sha="head123"),
+        expected_base_ref_name="main",
+        required_check_names=(),
+    )
+
+    assert "PR merge state status is DIRTY." in summary.blocking_reasons
+    assert summary.hard_gate_passed is False
+
+
+def test_pre_merge_blocks_missing_head_sha():
+    summary = summarize_pre_merge(build_pr_context(head_ref_oid=""), expected_base_ref_name="main", required_check_names=())
+
+    assert "Current PR head SHA is unknown." in summary.blocking_reasons
+    assert "Current PR head SHA is unknown, so approval cannot be verified." in summary.blocking_reasons
+    assert summary.hard_gate_passed is False
+
+
+def test_pre_merge_blocks_unexpected_target_branch():
+    summary = summarize_pre_merge(
+        scenario_current_approval(
+            head_sha="head123",
+            base_ref_name="release",
+            status_checks=(build_check(name="unit", bucket="success", status="COMPLETED", conclusion="SUCCESS"),),
+        ),
+        expected_base_ref_name="main",
+        required_check_names=("unit",),
+    )
+
+    assert "PR targets base branch release, expected main." in summary.blocking_reasons
+    assert summary.hard_gate_passed is False
+
+
+def test_pre_merge_blocks_when_required_checks_are_not_reported():
+    summary = summarize_pre_merge(
+        scenario_empty_status_rollup(head_sha="head123"),
+        expected_base_ref_name="main",
+        required_check_names=("unit",),
+    )
+
+    assert "GitHub reported no status checks for the current head SHA." in summary.blocking_reasons
+    assert summary.hard_gate_passed is False
+
+
+def test_pre_merge_blocks_unresolved_review_threads():
+    context = scenario_current_approval(head_sha="head123")
+    review_threads = summarize_review_threads(context, (review_thread(thread_id="active-thread"),))
+
+    summary = summarize_pre_merge(
+        context,
+        expected_base_ref_name="main",
+        required_check_names=(),
+        review_threads=review_threads,
+    )
+
+    assert "Unresolved review thread src/app.py:10 (active-thread): Thread is unresolved and still applies to the current PR head." in summary.blocking_reasons
+    assert next(check for check in summary.checks if check.code == "unresolved-review-threads").ok is False
+    assert summary.to_dict()["unresolved_thread_summary"]["thread_counts"]["unresolved_blocking"] == 1
+    assert summary.hard_gate_passed is False
+
+
+def test_pre_merge_allows_absent_checks_when_none_are_required():
+    summary = summarize_pre_merge(
+        scenario_separate_session_review(head_sha="head123"),
+        expected_base_ref_name="main",
+        required_check_names=(),
+    )
+
+    assert "GitHub reported no required status checks for the target branch." not in summary.blocking_reasons
+    assert summary.checks[5].ok is True
+
+
+def test_pre_merge_allows_unavailable_checks_when_policy_absent():
+    summary = summarize_pre_merge(
+        scenario_separate_session_review(head_sha="head123"),
+        expected_base_ref_name="main",
+        required_checks=RequiredStatusChecks(
+            names=(),
+            status="policy_absent",
+            source="docs/MERGE-POLICY.md#main-required-check-policy",
+        ),
+    )
+
+    required_check = next(check for check in summary.checks if check.code == "required-checks-passing")
+    assert summary.blocking_reasons == ()
+    assert summary.hard_gate_passed is True
+    assert required_check.ok is True
+    assert required_check.message == "Required status checks are absent by repository policy. Source: docs/MERGE-POLICY.md#main-required-check-policy."
+    assert summary.to_dict()["required_check_summary"]["required_check_status"] == "policy_absent"
+
+
+def test_pre_merge_blocks_generic_unavailable_required_check_data():
+    summary = summarize_pre_merge(
+        scenario_separate_session_review(head_sha="head123", base_ref_name="release"),
+        expected_base_ref_name="release",
+        required_checks=RequiredStatusChecks(names=(), status="unavailable", message="Not Found"),
+    )
+
+    assert "Required status check data is unavailable from branch protection: Not Found." in summary.blocking_reasons
+    assert summary.hard_gate_passed is False
+
+
+def test_pre_merge_blocks_unknown_reported_checks_even_when_policy_absent():
+    summary = summarize_pre_merge(
+        scenario_separate_session_review(
+            head_sha="head123",
+            status_checks=(build_check(name="security", bucket="unknown"),),
+        ),
+        expected_base_ref_name="main",
+        required_checks=RequiredStatusChecks(names=(), status="policy_absent", source="docs/MERGE-POLICY.md"),
+    )
+
+    assert "Status check security has an unknown result (state=unknown)." in summary.blocking_reasons
+    assert summary.hard_gate_passed is False
+
+
+def _write_required_policy(repo_root, required="required", workflows="present_required"):
+    policy = repo_root / "docs" / "required-check-policy.json"
+    policy.parent.mkdir()
+    policy.write_text(
+        '{"schema":"headless-pr-workflow.required-check-policy.v1",'
+        f'"branches":{{"main":{{"required_status_checks":"{required}","ci_workflows":"{workflows}",'
+        '"source":"docs/MERGE-POLICY.md#main-required-check-policy"}}}',
+        encoding="utf-8",
+    )
+    workflows = repo_root / ".github" / "workflows"
+    workflows.mkdir(parents=True)
+    (workflows / "tests.yml").write_text("name: tests", encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("bucket", "reason"),
+    [
+        ("failure", "Status check pytest is failing"),
+        ("pending", "Status check pytest is pending"),
+    ],
+)
+def test_pre_merge_blocks_failing_or_pending_required_check_under_required_policy(monkeypatch, tmp_path, bucket, reason):
+    _write_required_policy(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    summary = summarize_pre_merge(
+        scenario_separate_session_review(head_sha="head123", status_checks=(build_check(name="pytest", bucket=bucket),)),
+        expected_base_ref_name="main",
+        required_checks=RequiredStatusChecks(names=("pytest",), status="configured"),
+    )
+
+    assert summary.hard_gate_passed is False
+    assert any(blocker.startswith(reason) for blocker in summary.blocking_reasons)
+    assert summary.to_dict()["required_check_summary"]["required_check_status"] != "policy_absent"
+
+
+def test_pre_merge_blocks_unavailable_required_check_data_under_required_policy(monkeypatch, tmp_path):
+    _write_required_policy(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    summary = summarize_pre_merge(
+        scenario_separate_session_review(head_sha="head123", status_checks=()),
+        expected_base_ref_name="main",
+        required_checks=RequiredStatusChecks(names=(), status="unavailable", message="Not Found"),
+    )
+
+    assert summary.hard_gate_passed is False
+    assert "Required status check data is unavailable from branch protection: Not Found." in summary.blocking_reasons
+    assert summary.to_dict()["required_check_summary"]["required_check_status"] == "unavailable"
+
+
+@pytest.mark.parametrize(
+    "status_checks",
+    [
+        (),
+        (build_check(name="lint", bucket="success", status="COMPLETED", conclusion="SUCCESS"),),
+    ],
+)
+def test_pre_merge_blocks_unconfigured_required_checks_under_required_policy(monkeypatch, tmp_path, status_checks):
+    _write_required_policy(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    summary = summarize_pre_merge(
+        scenario_separate_session_review(head_sha="head123", status_checks=status_checks),
+        expected_base_ref_name="main",
+        required_checks=RequiredStatusChecks(names=(), status="not_configured"),
+    )
+
+    assert summary.hard_gate_passed is False
+    assert (
+        "Repository policy requires status checks for main, but GitHub reports none configured. "
+        "Source: docs/MERGE-POLICY.md#main-required-check-policy."
+    ) in summary.blocking_reasons
+    assert summary.to_dict()["required_check_summary"]["required_check_status"] == "policy_required_unconfigured"
+
+
+@pytest.mark.parametrize(
+    ("required", "workflows"),
+    [
+        ("absent", "present_required"),
+        ("required", "present_non_required"),
+        ("required", "absent"),
+        ("mandatory", "present_required"),
+    ],
+)
+@pytest.mark.parametrize(
+    "required_checks",
+    [
+        RequiredStatusChecks(names=(), status="not_configured"),
+        RequiredStatusChecks(names=(), status="unavailable", message="Not Found"),
+    ],
+)
+def test_pre_merge_blocks_inconsistent_required_check_policy(monkeypatch, tmp_path, required, workflows, required_checks):
+    _write_required_policy(tmp_path, required=required, workflows=workflows)
+    monkeypatch.chdir(tmp_path)
+    summary = summarize_pre_merge(
+        scenario_separate_session_review(head_sha="head123", status_checks=()),
+        expected_base_ref_name="main",
+        required_checks=required_checks,
+    )
+
+    assert summary.hard_gate_passed is False
+    assert (
+        f"Repository policy for main is inconsistent: required_status_checks={required!r}, "
+        f"ci_workflows={workflows!r}. Source: docs/MERGE-POLICY.md#main-required-check-policy."
+    ) in summary.blocking_reasons
+    assert summary.to_dict()["required_check_summary"]["required_check_status"] == "policy_inconsistent"
+
+
+def test_pre_merge_passes_with_clean_codex_review_and_reports_the_source():
+    summary = summarize_pre_merge(scenario_codex_review(), expected_base_ref_name="main", required_check_names=())
+
+    payload = summary.to_dict()
+    assert summary.hard_gate_passed is True
+    assert payload["approval"]["approval_source"] == "codex-review"
+    assert payload["approval"]["satisfied_by"] == "codex-review"
+    assert payload["approval_review_source"]["approval_source"] == "codex-review"
+    assert payload["approval_review_source"]["codex_review"]["status"] == "accepted"
+    assert payload["approval_review_source"]["separate_session_review"]["status"] == "missing"
+    assert "solo_override" not in payload["approval_review_source"]
+
+
+def test_pre_merge_passes_with_separate_session_review_and_reports_the_source():
+    summary = summarize_pre_merge(
+        scenario_separate_session_review(head_sha="head123"),
+        expected_base_ref_name="main",
+        required_check_names=(),
+    )
+
+    payload = summary.to_dict()
+    assert summary.hard_gate_passed is True
+    assert payload["approval_review_source"]["approval_source"] == "separate-session-review"
+    assert payload["approval_review_source"]["satisfied_by"] == "separate-session-review"
+    assert payload["approval_review_source"]["separate_session_review"]["reviewer_provider"] == "codex"
+
+
+def test_pre_merge_never_passes_when_the_codex_recognizer_rejects_the_evidence():
+    superseded = scenario_codex_review(
+        timeline=(commit_event(HEAD_SHA), codex_comment(), codex_findings_review(HEAD_SHA)),
+    )
+
+    summary = summarize_pre_merge(superseded, expected_base_ref_name="main", required_check_names=())
+
+    reason = "a newer Codex review submission follows the clean Codex review comment"
+    payload = summary.to_dict()
+    assert summary.hard_gate_passed is False
+    assert reason in summary.blocking_reasons
+    assert payload["approval_review_source"]["approval_source"] is None
+    assert payload["approval_review_source"]["codex_review"]["status"] == "superseded"
+    assert payload["approval_review_source"]["codex_review"]["reason"] == reason
+
+
+def test_pre_merge_never_passes_when_the_separate_session_recognizer_rejects_the_evidence():
+    summary = summarize_pre_merge(
+        scenario_separate_session_review(head_sha="head123", reviewer_provider=None),
+        expected_base_ref_name="main",
+        required_check_names=(),
+    )
+
+    payload = summary.to_dict()
+    assert summary.hard_gate_passed is False
+    assert payload["approval_review_source"]["approval_source"] is None
+    assert payload["approval_review_source"]["separate_session_review"]["status"] == "invalid"
+    assert payload["approval_review_source"]["separate_session_review"]["reason"] in summary.blocking_reasons

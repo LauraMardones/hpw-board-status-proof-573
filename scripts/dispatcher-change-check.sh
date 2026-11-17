@@ -1,0 +1,461 @@
+#!/usr/bin/env bash
+# Deterministic, read-only checks for dispatcher and Slack shell changes.
+#
+# Supported static patterns:
+# - Slack calls are executable logical commands containing a path ending in
+#   slack-notify.sh; comments and the adapter itself are excluded.
+# - A call is dry-run safe when it is in the else arm of an if containing
+#   DRY_RUN, or follows a DRY_RUN branch that returns before the call.
+# - stdout-json inspects echo/printf commands in a function containing a Slack
+#   call. Stderr writes are exempt.
+# - dispatch-handled inspects literal `exit 1` paths marked expected/blocker in
+#   their preceding context. Helper/unexpected failure exits are excluded.
+# - verified-write (ADR-014 -> Decision -> 5, issue #432) flags a GitHub write
+#   that does not go through `hpw dispatcher write`: `gh api` with a write method
+#   (-X/--method POST|PATCH|PUT|DELETE), `-f body=` or `--input`; a GraphQL
+#   `mutation(`/`mutation {`; `gh issue|pr comment|edit|close|reopen|ready|merge|review`;
+#   `gh label`; `curl` with a write method. Comment lines, the block's own shim
+#   functions and the VERIFIED_WRITE_ALLOW functions are not checked. It also
+#   applies to scripts/lib/*.sh, which the dispatcher sources; the other checks
+#   do not.
+# - own-marker (ADR-014 -> Decision -> 5, issue #433) flags a marker read or
+#   written outside Block 2 (`hpw dispatcher marker`): a literal `hpw:dispatcher`
+#   or `hpw:codex-review-bookkeeping`, a `gh api user` or `/user` call, a jq
+#   filter on `.user.login`, and a match on a visible marker text read from
+#   comments (DECISION_BLOCKER_CLAIM_MARKER, DECISION_BLOCKER_RESUME_MARKER).
+#   Comment lines, the block's own shim functions and the OWN_MARKER_ALLOW
+#   functions are not checked. Like verified-write, it covers scripts/lib/*.sh.
+#
+# - saved-state (ADR-014 -> Decision -> 5, issue #434) flags saved state read or
+#   written outside Block 3 (`hpw dispatcher state`): a redirect, `cp`, `mv`,
+#   `rm`, `cat`, `read <` or `mkdir` on a path under `.dispatcher-state`,
+#   `.dispatcher-usage` or `.dispatcher-allowance`, or on a variable named
+#   `*STATE_DIR`, `*STATE_FILE`, `HOLD_FILE`, `SESSIONS_FILE` or `NOTIFIED_FILE`.
+#   Comment lines, the block's own shim functions and the SAVED_STATE_ALLOW
+#   functions are not checked. It covers scripts/lib/*.sh too. It also makes
+#   .github/workflows/dispatcher.yml eligible and flags there an
+#   `actions/cache/save` key without `github.run_attempt`, a cache save whose
+#   `if:` has no `always()`, and a `run:` step that calls `gh` directly.
+#
+# Results: PASS|FAIL <path-or-> <check-id> - <reason>
+# Exit 0: all applicable checks pass (including all-SKIP)
+# Exit 1: at least one policy check fails
+# Exit 2: invalid arguments, unreadable input, or diff discovery failure
+
+set -uo pipefail
+
+usage() {
+    cat <<'USAGE'
+Usage: bash scripts/dispatcher-change-check.sh [--files <file1> [file2 ...]]
+
+Checks changed dispatcher-*.sh and slack-notify.sh files. With no --files,
+paths come from `git diff --name-only main`.
+
+Exit codes: 0 checks pass/all skip; 1 policy failure; 2 input error.
+USAGE
+}
+
+die() { printf 'dispatcher-change-check: %s\n' "$*" >&2; exit 2; }
+
+CHECKS=(executable slack-guard dry-run stdout-json dispatch-handled verified-write own-marker saved-state)
+
+# The shims of Block 1 in scripts/dispatcher-invoke.sh: they call the block.
+VERIFIED_WRITE_SHIMS=(dispatcher_write write_field post_comment evidence_retry label_pending_cleanup)
+# Exceptions: one "<function> <check-id>" per "stays" row of ADR-014 -> Decision
+# -> 7 that the rule would otherwise flag. Adding one means amending the ADR.
+VERIFIED_WRITE_ALLOW=(
+    "graphql verified-write"  # dispatcher-poll.sh: read-only GraphQL query sent with curl -X POST
+)
+# The shims of Block 2 in scripts/dispatcher-invoke.sh and the other scripts: they call the block.
+OWN_MARKER_SHIMS=(dispatcher_marker marker_block resolve_dispatcher_login marker_holds bot_comments_json
+    marker_list_json bookkeeping_fix_marker_init bookkeeping_login newest_own_comment_body
+    own_comments_json load_token_login)
+# Exceptions: one "<function> own-marker" per "stays" row of ADR-014 -> Decision
+# -> 7 that the rule would otherwise flag. Adding one means amending the ADR.
+OWN_MARKER_ALLOW=(
+    "latest_decision_blocker_json own-marker"  # reads Blocked Declarations and the PO's /unblock, not dispatcher markers
+    "conflict_round_rule own-marker"  # pure decision rule over the three logins it is given
+    "evidence_pending_comment own-marker"  # builds the evidence-pending text of #348; read back through Block 2
+    "scan_job_blockers own-marker"  # dispatcher-notify-retry.sh (issue #393): the bookkeeping job's declarations, posted under the PO account
+    "resolved own-marker"  # dispatcher-notify-retry.sh: the PO's /unblock line after a blocker event
+)
+# The shims of Block 3 in the dispatcher scripts: they call `hpw dispatcher state`.
+SAVED_STATE_SHIMS=(state_block state_write read_count load_state save_state)
+# Exceptions: one "<function> saved-state" per "stays" row of ADR-014 -> Decision
+# -> 7 that the rule would otherwise flag. Adding one means amending the ADR.
+SAVED_STATE_ALLOW=()
+files=()
+case "${1-}" in
+    --help) [[ $# -eq 1 ]] || die '--help does not accept arguments'; usage; exit 0 ;;
+    --files) shift; [[ $# -gt 0 ]] || die '--files requires at least one path'; files=("$@") ;;
+    '')
+        mapfile -t files < <(git diff --name-only main) || die 'could not discover changed files from main'
+        # Process substitution hides command status, so independently verify the ref/diff.
+        git rev-parse --verify main >/dev/null 2>&1 || die "cannot resolve Git ref 'main'"
+        git diff --quiet main -- . >/dev/null 2>&1
+        rc=$?
+        [[ $rc -le 1 ]] || die 'could not discover changed files from main'
+        ;;
+    *) die "unknown option or argument: ${1}" ;;
+esac
+
+eligible=()
+for file in "${files[@]}"; do
+    base=${file##*/}
+    if [[ $base == dispatcher-*.sh || $base == slack-notify.sh || $file == *lib/*.sh || $base == dispatcher.yml ]]; then
+        [[ -f $file && -r $file ]] || die "eligible file is missing or unreadable: $file"
+        eligible+=("$file")
+    fi
+done
+
+if [[ ${#eligible[@]} -eq 0 ]]; then
+    for check in "${CHECKS[@]}"; do
+        printf 'SKIP - %s - no eligible dispatcher or Slack files\n' "$check"
+    done
+    exit 0
+fi
+
+failed=0
+result() {
+    local status=$1 file=$2 check=$3 reason=$4
+    printf '%s %s %s - %s\n' "$status" "$file" "$check" "$reason"
+    [[ $status != FAIL ]] || failed=1
+}
+
+# Join backslash-continued source lines. This is intentionally not a full parser.
+logical_source() {
+    awk '
+      {
+        sub(/\r$/, "")
+        continued=($0 ~ /\\[[:space:]]*$/)
+        if (continued) sub(/\\[[:space:]]*$/, "")
+        if (pending) line=line $0
+        else line=$0
+        if (continued) { pending=1; next }
+        print line
+        line=""
+        pending=0
+      }
+      END { if (line != "") print line }
+    ' "$1"
+}
+
+# verified_write_hits <logical-source-file> — "<line>:<function>:<text>" for each
+# flagged write outside the shim and allowlisted functions.
+verified_write_hits() {
+    local skip=" ${VERIFIED_WRITE_SHIMS[*]} " entry
+    for entry in "${VERIFIED_WRITE_ALLOW[@]}"; do
+        [[ ${entry#* } == verified-write ]] && skip+="${entry%% *} "
+    done
+    awk -v skip="$skip" '
+      /^[[:space:]]*#/ { next }
+      /^[[:space:]]*(function[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\(\)/ {
+        fn=$0; sub(/^[[:space:]]*(function[[:space:]]+)?/, "", fn); sub(/[[:space:]]*\(.*/, "", fn)
+        if ($0 ~ /}[[:space:]]*$/) { if (index(skip, " " fn " ") == 0) check(); fn=""; next }  # one-line function
+      }
+      /^}/ { if (fn != "" && index(skip, " " fn " ") == 0) check(); fn=""; next }
+      { if (fn == "" || index(skip, " " fn " ") == 0) check() }
+      function check(   l, write_method, body_field) {
+        l=$0
+        # \047 is a single quote; this program is itself single-quoted.
+        write_method="(-X|--method|--request)[[:space:]=]*[\"\047]?(POST|PATCH|PUT|DELETE)"
+        body_field="(-f|--raw-field|-F|--field)[[:space:]]+[\"\047]?body="
+        if ((l ~ /gh[[:space:]]+api/ && (l ~ write_method || l ~ body_field || l ~ /--input([[:space:]]|=)/)) ||
+            l ~ /mutation[[:space:]]*([A-Za-z_][A-Za-z0-9_]*[[:space:]]*)?[({]/ ||
+            l ~ /gh[[:space:]]+(issue|pr)[[:space:]]+(comment|edit|close|reopen|ready|merge|review)([[:space:]]|$)/ ||
+            l ~ /gh[[:space:]]+label([[:space:]]|$)/ ||
+            (l ~ /curl([[:space:]]|$)/ && l ~ write_method))
+          print NR ":" (fn == "" ? "-" : fn) ":" l
+      }
+    ' "$1"
+}
+
+# own_marker_hits <logical-source-file> — "<line>:<function>:<text>" for each
+# marker read or write outside the shim and allowlisted functions.
+own_marker_hits() {
+    local skip=" ${OWN_MARKER_SHIMS[*]} " entry
+    for entry in "${OWN_MARKER_ALLOW[@]}"; do
+        [[ ${entry#* } == own-marker ]] && skip+="${entry%% *} "
+    done
+    awk -v skip="$skip" '
+      /^[[:space:]]*#/ { next }
+      /^[[:space:]]*(function[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\(\)/ {
+        fn=$0; sub(/^[[:space:]]*(function[[:space:]]+)?/, "", fn); sub(/[[:space:]]*\(.*/, "", fn)
+        if ($0 ~ /}[[:space:]]*$/) { if (index(skip, " " fn " ") == 0) check(); fn=""; next }  # one-line function
+      }
+      /^}/ { if (fn != "" && index(skip, " " fn " ") == 0) check(); fn=""; next }
+      { if (fn == "" || index(skip, " " fn " ") == 0) check() }
+      function check(   l) {
+        l=$0
+        if (l ~ /^[[:space:]]*DECISION_BLOCKER_(CLAIM|RESUME)_MARKER=/) return
+        if (l ~ /hpw:dispatcher/ || l ~ /hpw:codex-review-bookkeeping/ ||
+            l ~ /gh[[:space:]]+api[[:space:]]+user([[:space:]"]|$)/ ||
+            l ~ /\/user(["[:space:])|]|$)/ ||
+            l ~ /\.user\.login/ ||
+            l ~ /DECISION_BLOCKER_(CLAIM|RESUME)_MARKER/)
+          print NR ":" (fn == "" ? "-" : fn) ":" l
+      }
+    ' "$1"
+}
+
+# saved_state_hits <logical-source-file> — "<line>:<function>:<text>" for each
+# saved-state read or write outside the shim and allowlisted functions.
+saved_state_hits() {
+    local skip=" ${SAVED_STATE_SHIMS[*]} " entry
+    for entry in "${SAVED_STATE_ALLOW[@]}"; do
+        [[ ${entry#* } == saved-state ]] && skip+="${entry%% *} "
+    done
+    awk -v skip="$skip" '
+      /^[[:space:]]*#/ { next }
+      /^[[:space:]]*(function[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\(\)/ {
+        fn=$0; sub(/^[[:space:]]*(function[[:space:]]+)?/, "", fn); sub(/[[:space:]]*\(.*/, "", fn)
+        if ($0 ~ /}[[:space:]]*$/) { if (index(skip, " " fn " ") == 0) check(); fn=""; next }  # one-line function
+      }
+      /^}/ { if (fn != "" && index(skip, " " fn " ") == 0) check(); fn=""; next }
+      { if (fn == "" || index(skip, " " fn " ") == 0) check() }
+      function check(   l, ref) {
+        l=$0
+        # \047 is a single quote; this program is itself single-quoted.
+        ref="(\\.dispatcher-(state|usage|allowance)|[$][{]?([A-Za-z0-9_]*(STATE_DIR|STATE_FILE)|HOLD_FILE|SESSIONS_FILE|NOTIFIED_FILE)([^A-Za-z0-9_]|$))"
+        if (l ~ ("[<>][<>]?[[:space:]]*[\"\047]?" ref) ||
+            l ~ ("(^|[[:space:];&|(])(cp|mv|rm|cat|mkdir)[[:space:]].*" ref))
+          print NR ":" (fn == "" ? "-" : fn) ":" l
+      }
+    ' "$1"
+}
+
+# workflow_state_hits <workflow-file> — "<step>: <reason>" for each cache save
+# whose key lacks github.run_attempt or whose if: lacks always(), and each run:
+# step that calls gh directly. Not a YAML parser: it reads the step layout the
+# dispatcher workflow uses (steps at six spaces, keys at eight).
+workflow_state_hits() {
+    awk '
+      function finish(   ) {
+        if (is_save) {
+          if (key !~ /github[.]run_attempt/) print name ": the cache save key has no github.run_attempt"
+          if (cond !~ /always[(][)]/) print name ": the cache save if: has no always()"
+        }
+        is_save=0; key=""; cond=""
+      }
+      /^      - / { finish(); name=$0; sub(/^      - (name: )?/, "", name); in_run=0 }
+      /^        if:/ { cond=$0 }
+      /^          key:/ { key=key $0 }
+      /uses:[[:space:]]*actions\/cache\/save/ { is_save=1 }
+      /^        run:/ {
+        in_run=1; run_indent=8
+        l=$0; sub(/^        run:[[:space:]]*/, "", l)
+        if (l ~ /^[|>][-+]?[[:space:]]*$/) next
+        if (l ~ /(^|[[:space:];&|(`])gh[[:space:]]+[A-Za-z]/) print name ": a run: step calls gh directly"
+        in_run=0; next
+      }
+      in_run && /^          / {
+        if ($0 !~ /^[[:space:]]*#/ && $0 ~ /(^|[[:space:];&|(`])gh[[:space:]]+[A-Za-z]/) print name ": a run: step calls gh directly"
+        next
+      }
+      in_run && !/^[[:space:]]*$/ { in_run=0 }
+      END { finish() }
+    ' "$1" | sort -u
+}
+
+report_saved_state() {
+    local file=$1 logical=$2 hits
+    hits=$(saved_state_hits "$logical")
+    if [[ -z $hits ]]; then
+        result PASS "$file" saved-state 'no saved state read or written outside hpw dispatcher state'
+    else
+        result FAIL "$file" saved-state "saved state read or written outside hpw dispatcher state at line(s) $(cut -d: -f1 <<<"$hits" | paste -sd, -) (function $(cut -d: -f2 <<<"$hits" | sort -u | paste -sd, -))"
+    fi
+}
+
+report_own_marker() {
+    local file=$1 logical=$2 hits
+    hits=$(own_marker_hits "$logical")
+    if [[ -z $hits ]]; then
+        result PASS "$file" own-marker 'no marker read or written outside hpw dispatcher marker'
+    else
+        result FAIL "$file" own-marker "marker read or written outside hpw dispatcher marker at line(s) $(cut -d: -f1 <<<"$hits" | paste -sd, -) (function $(cut -d: -f2 <<<"$hits" | sort -u | paste -sd, -))"
+    fi
+}
+
+for file in "${eligible[@]}"; do
+    base=${file##*/}
+
+    if [[ $file == *lib/*.sh && $base != dispatcher-*.sh ]]; then
+        # A library the dispatcher sources: only the verified-write and own-marker rules apply.
+        for check in executable slack-guard dry-run stdout-json dispatch-handled; do
+            result SKIP "$file" "$check" 'library file; only verified-write and own-marker apply'
+        done
+        tmp=$(mktemp)
+        logical_source "$file" >"$tmp"
+        hits=$(verified_write_hits "$tmp")
+        if [[ -z $hits ]]; then
+            result PASS "$file" verified-write 'no GitHub write outside hpw dispatcher write'
+        else
+            result FAIL "$file" verified-write "GitHub write outside hpw dispatcher write at line(s) $(cut -d: -f1 <<<"$hits" | paste -sd, -) (function $(cut -d: -f2 <<<"$hits" | sort -u | paste -sd, -))"
+        fi
+        report_own_marker "$file" "$tmp"
+        report_saved_state "$file" "$tmp"
+        rm -f "$tmp"
+        continue
+    fi
+
+    if [[ $base == dispatcher.yml ]]; then
+        # The dispatcher workflow: only saved-state applies (cache keys, saves, gh in run:).
+        for check in executable slack-guard dry-run stdout-json dispatch-handled verified-write own-marker; do
+            result SKIP "$file" "$check" 'workflow file; only saved-state applies'
+        done
+        hits=$(workflow_state_hits "$file")
+        if [[ -z $hits ]]; then
+            result PASS "$file" saved-state 'every cache save key has github.run_attempt and always(), and no run: step calls gh'
+        else
+            result FAIL "$file" saved-state "$(paste -sd';' - <<<"$hits")"
+        fi
+        continue
+    fi
+
+    mode=$(git ls-files --stage -- "$file" 2>/dev/null | awk 'NR==1 {print $1}')
+    if [[ -n $mode ]]; then
+        [[ $mode == 100755 ]] && result PASS "$file" executable 'Git mode is 100755' \
+            || result FAIL "$file" executable "Git mode is ${mode}, expected 100755"
+    elif [[ -x $file ]]; then
+        result PASS "$file" executable 'untracked fixture is executable'
+    else
+        result FAIL "$file" executable 'untracked file is not executable'
+    fi
+
+    tmp=$(mktemp)
+    logical_source "$file" >"$tmp"
+    calls=$(awk '
+      /^[[:space:]]*#/ { next }
+      /^[[:space:]]*(if[[:space:]]+|![[:space:]]+)?(bash[[:space:]]+)?(".*slack-notify\.sh"|[^[:space:];|&]*slack-notify\.sh"?)([[:space:]]|$)/ { print NR ":" $0 }
+    ' "$tmp")
+    if [[ $base == slack-notify.sh || -z $calls ]]; then
+        result SKIP "$file" slack-guard 'no direct Slack adapter calls'
+    elif awk -F: '{ sub(/^[^:]*:/, ""); if ($0 !~ /\|\|[[:space:]]*true([[:space:]]*(#.*)?)?$/) bad=1 } END { exit bad }' <<<"$calls"; then
+        result PASS "$file" slack-guard 'all direct Slack calls end with || true'
+    else
+        result FAIL "$file" slack-guard 'a direct Slack call is missing same-command || true'
+    fi
+
+    if [[ $base == slack-notify.sh || -z $calls ]]; then
+        result SKIP "$file" dry-run 'no dispatcher Slack call to suppress'
+    elif ! grep -q 'DRY_RUN' "$tmp"; then
+        result SKIP "$file" dry-run 'file has no dry-run path'
+    elif awk '
+      { lines[NR]=$0 }
+      /^[[:space:]]*(if[[:space:]]+|![[:space:]]+)?(bash[[:space:]]+)?(".*slack-notify\.sh"|[^[:space:];|&]*slack-notify\.sh"?)([[:space:]]|$)/ { call[NR]=1 }
+      END {
+        for (n in call) {
+          safe=0; seen_else=0
+          for (i=n-1; i>=1 && i>=n-40; i--) {
+            if (lines[i] ~ /^[[:space:]]*else([[:space:]]|$)/) seen_else=1
+            if (lines[i] ~ /^[[:space:]]*if .*DRY_RUN/) {
+              if (seen_else) safe=1
+              for (j=i+1; j<n; j++) if (lines[j] ~ /^[[:space:]]*(return|exit)([[:space:]]|$)/) safe=1
+              break
+            }
+            if (lines[i] ~ /^[[:space:]]*}[[:space:]]*$/) break
+          }
+          if (!safe) bad=1
+        }
+        exit bad
+      }
+    ' "$tmp"; then
+        result PASS "$file" dry-run 'all Slack calls are suppressed by a supported dry-run guard'
+    else
+        result FAIL "$file" dry-run 'Slack suppression cannot be established for the supported dry-run patterns'
+    fi
+
+    if [[ $base == slack-notify.sh || -z $calls ]]; then
+        result SKIP "$file" stdout-json 'no notification path with a direct Slack call'
+    elif awk '
+      function inspect(   i) {
+        if (!has_call) return
+        applicable=1
+        for (i=start; i<=end; i++) {
+          if (src[i] ~ /^[[:space:]]*(echo|printf)([[:space:]]|$)/ &&
+              src[i] !~ /({|>&2|1>&2|\/dev\/stderr)/) bad=1
+        }
+      }
+      { src[NR]=$0 }
+      /^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\(\)[[:space:]]*\{/ { inspect(); start=NR; has_call=0 }
+      start && /^[[:space:]]*(if[[:space:]]+|![[:space:]]+)?(bash[[:space:]]+)?(".*slack-notify\.sh"|[^[:space:];|&]*slack-notify\.sh"?)([[:space:]]|$)/ { has_call=1 }
+      start && /^[[:space:]]*}[[:space:]]*$/ { end=NR; inspect(); start=0; has_call=0 }
+      END { if (start) { end=NR; inspect() }; if (!applicable) exit 2; exit bad }
+    ' "$tmp"; then
+        result PASS "$file" stdout-json 'notification-path stdout literals contain {'
+    else
+        rc=$?
+        if [[ $rc -eq 2 ]]; then
+            result SKIP "$file" stdout-json 'no supported notification function contains stdout output'
+        else
+            result FAIL "$file" stdout-json 'notification-path stdout literal does not contain {'
+        fi
+    fi
+
+    if ! grep -q 'DISPATCH_HANDLED' "$tmp"; then
+        result SKIP "$file" dispatch-handled 'file does not use DISPATCH_HANDLED policy'
+    else
+        set +e
+        awk '
+          { src[NR]=$0 }
+          END {
+            for (n=1; n<=NR; n++) if (src[n] ~ /^[[:space:]]*exit[[:space:]]+1([[:space:]]*(#.*)?)?$/) {
+              expected=0; handled=0
+              for (i=n-1; i>=1 && i>=n-12; i--) {
+                low=tolower(src[i])
+                if (low ~ /(expected|blocker)/) expected=1
+                if (src[i] ~ /DISPATCH_HANDLED[[:space:]]*=[[:space:]]*true/) handled=1
+                if (src[i] ~ /^[[:space:]]*(else|fi|}[[:space:]]*)$/) break
+              }
+              if (expected) { applicable=1; if (!handled) bad=1 }
+            }
+            if (!applicable) exit 2
+            exit bad
+          }
+        ' "$tmp"
+        rc=$?
+        set -e
+        if [[ $rc -eq 0 ]]; then
+            result PASS "$file" dispatch-handled 'expected exit 1 paths set DISPATCH_HANDLED=true'
+        elif [[ $rc -eq 2 ]]; then
+            result SKIP "$file" dispatch-handled 'no expected literal exit 1 paths matched'
+        else
+            result FAIL "$file" dispatch-handled 'an expected exit 1 path lacks DISPATCH_HANDLED=true'
+        fi
+    fi
+
+    if [[ $base == slack-notify.sh ]]; then
+        result SKIP "$file" verified-write 'the Slack adapter writes no GitHub state'
+    elif [[ $base == dispatcher-change-check.sh ]]; then
+        # ADR-014 -> Decision -> 7: the checker itself makes no GitHub call; its
+        # own patterns would match.
+        result SKIP "$file" verified-write 'the checker itself makes no GitHub call'
+    else
+        hits=$(verified_write_hits "$tmp")
+        if [[ -z $hits ]]; then
+            result PASS "$file" verified-write 'no GitHub write outside hpw dispatcher write'
+        else
+            result FAIL "$file" verified-write "GitHub write outside hpw dispatcher write at line(s) $(cut -d: -f1 <<<"$hits" | paste -sd, -) (function $(cut -d: -f2 <<<"$hits" | sort -u | paste -sd, -))"
+        fi
+    fi
+
+    if [[ $base == slack-notify.sh ]]; then
+        result SKIP "$file" own-marker 'the Slack adapter reads no markers'
+    elif [[ $base == dispatcher-change-check.sh ]]; then
+        result SKIP "$file" own-marker 'the checker itself reads no markers'
+    else
+        report_own_marker "$file" "$tmp"
+    fi
+
+    if [[ $base == slack-notify.sh ]]; then
+        result SKIP "$file" saved-state 'the Slack adapter keeps no saved state'
+    elif [[ $base == dispatcher-change-check.sh ]]; then
+        result SKIP "$file" saved-state 'the checker itself keeps no saved state'
+    else
+        report_saved_state "$file" "$tmp"
+    fi
+    rm -f "$tmp"
+done
+
+exit "$failed"

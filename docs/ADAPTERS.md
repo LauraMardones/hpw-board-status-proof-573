@@ -1,0 +1,184 @@
+# Adapters
+
+Adapters extend the reusable workflow without changing core policy.
+
+## Core Workflow Boundary
+
+Core owns:
+
+- GitHub source-of-truth rules.
+- SHA-bound approval semantics.
+- Review and implementation separation.
+- Takeover protocol.
+- Merge policy.
+- Generic worktree model.
+- Generic command contracts.
+
+Core must not own:
+
+- Product-specific domain checks.
+- Repository-specific documentation requirements.
+- Release train rules.
+- Assistant-specific prompts.
+- Local team preferences that are not workflow invariants.
+
+## Repo Adapters
+
+Repo adapters encode project-specific deterministic rules.
+
+Examples:
+
+- Protected files.
+- Mandatory docs based on changed paths.
+- Domain contract drift checks.
+- Required test commands.
+- Release gates.
+- Required labels.
+- Required reviewers by path.
+
+Repo adapters may add gates to pre-review or pre-merge flows. They must not weaken core gates.
+
+## Assistant Adapters
+
+Assistant adapters provide optional session guidance for tools such as Claude, Codex, Gemini, Copilot, or future assistants.
+
+Examples:
+
+- Session-start prompt.
+- Implementation-only prompt.
+- Review-only prompt.
+- Takeover prompt.
+- Pre-merge checklist prompt.
+- Tool-specific command recipes.
+
+Assistant adapters must remain non-normative. The workflow must still function if an assistant adapter is absent.
+
+## Adapter Contract
+
+An adapter should declare:
+
+- Adapter name.
+- Adapter type: `repo` or `assistant`.
+- Inputs it requires.
+- Commands or prompts it provides.
+- Core gates it depends on.
+- Additional gates it adds.
+- Whether failure is blocking or advisory.
+
+Adapter output should be structured enough for another assistant or script to consume.
+
+## Executor Routing
+
+Executor routing is data-driven. Capability profiles are declared per executor; no routing logic is hardcoded anywhere. This is an OSS compatibility invariant: any open-source model or future executor can participate by declaring a capability profile — routing must never depend on executor-specific logic embedded in commands or prompts.
+
+### Executor Roles
+
+| Executor | Role | Rationale |
+|---|---|---|
+| Claude Code | Implementation | Faster output, better context awareness, stronger on UI and code style. |
+| Codex | Code review, CI/CD, algorithmically complex tasks | Stronger bug identification, structured reasoning, 2–3× more token-efficient. |
+
+The Claude Code / Codex split is a declared capability boundary, not a policy preference. Any executor that declares equivalent capabilities may take either role.
+
+### Cross-Provider Review Pairing
+
+The Executor Roles table above describes the intended split, but a story's `executor:` label only ever governs `/implement` — it says nothing about who reviews it. `scripts/dispatcher-invoke.sh` closes that gap from two lookup tables, keyed by the executor that performed `/implement` (issues #263 and #293, ADR-006). No new `executor:` label value is introduced or stored — the review path is derived, not assigned.
+
+| `/implement` executor | Review | Table in `scripts/lib/review-routing.sh` |
+|---|---|---|
+| `executor:claude-code-haiku` | Codex Cloud, through the Codex review loop — no dispatcher session | `CODEX_REVIEW_LOOP_ROUTING` |
+| `executor:claude-code-sonnet` | Codex Cloud, through the Codex review loop — no dispatcher session | `CODEX_REVIEW_LOOP_ROUTING` |
+| `executor:claude-code-opus` | Codex Cloud, through the Codex review loop — no dispatcher session | `CODEX_REVIEW_LOOP_ROUTING` |
+| `executor:codex` | Not started for `/implement`; a Codex PR ready for review gets a `/review` session under Claude Opus (the "deep code review, complex reasoning" tier — see Claude Model Tiers below) | `REVIEW_EXECUTOR_ROUTING` |
+
+An executor with a row in neither table stops with a mid-cycle blocker after `/implement`, so a typo or a new tier never skips review silently.
+
+**Claude-implemented stories (Codex review loop).** Each Claude-implemented head is reviewed once, by Codex Cloud (ADR-006). `/implement` posts the review request, and the `codex-review-bookkeeping` workflow reads the answer; the PR's facts then show the story's status. The dispatcher's part is:
+
+1. **Hand-off.** After `/implement` succeeds, the dispatcher starts no `/review` session and counts no review session. It checks that the story has a linked open PR that is not a draft, and ends that story's run. It writes no board status: the board shows the non-draft PR as In review (see [PROJECT-STATUS.md](PROJECT-STATUS.md)).
+2. **Merge step.** On a later run, a story whose open, non-draft PR passes every merge gate except mergeability on its current head gets `/merge`, then the issue is closed (the board shows Done) and `/cleanup`, both as scripts (see Script-only phases below). This applies to every story, whatever its executor (issue #475). There is one `/merge` attempt per PR head.
+3. **Fix round.** A story for which the bookkeeping job recorded findings on the PR's current head gets `/implement` again on the same PR, whatever its executor. After that the hand-off applies again. The number of fix rounds per PR is limited by the repository variable `CODEX_FIX_ROUND_MAX` (default `3`).
+
+Each run handles resumable work before new work: the merge step, then fix rounds and pending hand-offs, then the review step, all found from pull request facts, not from board statuses (issue #475); then the scheduler's new work. The rules, bounds and log lines are in [DISPATCHER-CONFIG.md](DISPATCHER-CONFIG.md#codex-review-loop-hand-off-and-resume).
+
+**Codex-implemented stories (paired session).** The dispatcher does not start `/implement` for an `executor:codex` story (no subscription mechanism, ADR-012, issue #315); it skips it with a warning. A story with an open, non-draft PR that Codex implemented outside the dispatcher, and that is not in the merge step, gets a resume entry: `/review` under Claude Opus on the subscription, followed by the script-only `/merge` and `/cleanup` when the PR's merge gates then put it in the merge step. One `/review` attempt per PR head; see [DISPATCHER-CONFIG.md](DISPATCHER-CONFIG.md#review-of-a-codex-implemented-pr).
+
+**Script-only phases: `/merge` and `/cleanup` (issue #264).** No executor tier applies to these two phases. The dispatcher starts no model session for them: no Claude Code session, no model API call, no subscription-allowance check and no executor budget increment. `run_merge_or_block()` and `finish_story()` in `scripts/dispatcher-invoke.sh` run `scripts/dispatcher-merge.sh` and `scripts/dispatcher-cleanup.sh`, which reuse `scripts/merge-gate-summary` and the `hpw` helpers. This holds in every path: the Claude-tier cycle, the review entry for a Codex-implemented PR and the resume pass for a story whose PR is mergeable. A step the scripts cannot judge (for example a dirty file that is neither clearly a stale copy of the merged PR nor clearly unrelated) is kept and reported, never forced. The step-by-step map from `merge.md` and `cleanup.md` to the scripts and their tests is in [DISPATCHER-MERGE-CLEANUP-MAP.md](DISPATCHER-MERGE-CLEANUP-MAP.md). A manually run `/merge` or `/cleanup` still follows `.claude/commands/merge.md` and `cleanup.md`, which are unchanged; a later edit to either file needs the matching script change. ADR-012's session-start mechanism does not cover these two phases.
+
+This applies only to the dispatcher's own invocation path in `scripts/dispatcher-invoke.sh`. A human or interactive session running `/review` manually (`.claude/commands/review.md`) chooses its own reviewer and is unaffected.
+
+### Executor Invocation
+
+The dispatcher starts every model session (`/implement` and `/review`) through `invoke_executor_command()` in `scripts/dispatcher-invoke.sh`. The provider comes from the `EXECUTOR_PROVIDER` table, keyed by the executor label, so no executor name is branched on elsewhere. The task prompt is always `.claude/commands/<command>.md` with `$ARGUMENTS` substituted.
+
+| Executor labels | Provider | How the session starts |
+|---|---|---|
+| `executor:claude-code-haiku`, `-sonnet`, `-opus` | `claude-code` | Claude Code (`claude -p`) on the GitHub Actions runner, signed in with the PO's subscription token `CLAUDE_CODE_OAUTH_TOKEN`, with the model alias `haiku`, `sonnet` or `opus` (ADR-012, issue #314) |
+| `executor:codex` | none | Not started for `/implement` (issue #315); no `EXECUTOR_PROVIDER` row |
+
+Every Claude session runs this way: `/implement` and its fix rounds, and `/review` of a Codex-implemented story. `/merge` and `/cleanup` are script-only phases and start no session. No metered Anthropic API key is used. The command line, bounds, result handling and log lines are in [DISPATCHER-CONFIG.md](DISPATCHER-CONFIG.md#executor-invocation-mechanism).
+
+### Claude Model Tiers (Claude Code)
+
+> Advisory only, current as of 2026-08-09 — for human calibration when choosing an `executor:` label. Routing does not depend on these values: `scripts/dispatcher-invoke.sh` routes purely off `executor:` label suffixes, never off the model names or versions in this table. Since issue #314 the dispatcher starts each tier with the Claude Code alias (`haiku`, `sonnet`, `opus`); the Claude Code version pinned in `.github/workflows/dispatcher.yml` decides which model each alias means.
+
+| Label | Model | Appropriate task types |
+|---|---|---|
+| `executor:claude-code-haiku` | Haiku 4.5 (`claude-haiku-4-5-20251001`) | Setup, boilerplate, quick edits, scaffolding |
+| `executor:claude-code-sonnet` | Sonnet 5 (`claude-sonnet-5`) | Standard implementation, agentic workflows |
+| `executor:claude-code-opus` | Opus 5 (`claude-opus-5`) | Deep code review, complex reasoning, long-horizon tasks |
+
+### `executor:` Label Format
+
+Four label values are defined:
+
+- `executor:claude-code-haiku`
+- `executor:claude-code-sonnet`
+- `executor:claude-code-opus`
+- `executor:codex`
+
+The `executor:` label is set in refinement: `scripts/refine-check` requires exactly one on a story, task or bug. It is not tied to a board status, and a status change does not apply or move it. It signals which executor profile should pick up the story. A story is ready when it is refined and every hard dependency is closed (Ready to implement, see [PROJECT-STATUS.md](PROJECT-STATUS.md)); no executor pulls from a status.
+
+### Capability Profile Structure
+
+Each executor declares its own capability profile. The profile is the source of truth for routing decisions. Profiles are not inferred from executor names, tool versions, or runtime behavior.
+
+A capability profile declares:
+
+- Executor identifier (matches the `executor:` label value).
+- Roles the executor can fulfil.
+- Task types the executor is optimised for.
+- Any capacity or token constraints relevant to story sizing.
+
+Routing logic must read declared profiles, not branch on executor names. This is the OSS invariant: the workflow remains portable to any executor that can declare a conforming profile.
+
+## Decisions
+
+### Fable-tier executor label — 2026-08-09
+
+**Chosen:** Do not add `executor:claude-code-fable` now. The Claude Model Tiers table above stays at three tiers (Haiku, Sonnet, Opus). Revisit only if a concrete story needs Fable-level capability that Opus can't handle.
+
+**Rejected:** Adding Fable as a fifth executor tier now (new label, four `scripts/dispatcher-invoke.sh` table rows, a per-tier daily cap). Rejected because Fable costs roughly 2× Opus per unit of work (`claude-fable-5` at $10/$50 per MTok vs. `claude-opus-5` at $5/$25 per MTok) and responds more slowly, while Opus already covers the "deep code review, complex reasoning, long-horizon tasks" niche Fable would also serve. Building and maintaining a costly, unused fifth tier speculatively isn't worth it. Matches the precedent set in Bug #244, which deferred an analogous automated label-existence guard until a fifth tier is actually proposed.
+
+### Orchestration and critical-path stories use Opus — 2026-11-15
+
+**Chosen:** A story, task or bug labelled `flow:orchestration` or `cp:critical-path` (either label is enough) gets exactly `executor:claude-code-opus` at refinement. `scripts/refine-check` reports `orchestration_executor` and fails any other executor label, none, or two. Epics and Features carry no `executor:` label and are not affected. The rule combines with the size gate (`size_split`, `haiku_limit`) by taking the stronger minimum; neither lowers the other. It changes no dispatcher code: `executor:claude-code-opus` is already routed. Issues refined before the rule merged are not rechecked (issue #367, Epic #418 criterion E2).
+
+**Allowance cost trade-off.** An Opus session spends more of the one subscription allowance than a Sonnet session, and Opus alone does not prevent a lost session. Figures that exist:
+
+- `[SESSION]` lines and #401's survey (dispatcher runs 2026-10-13 to 2026-11-08, 94 `/implement` sessions, 147.6M input tokens): 7 sessions ended at the turn limit and used 56.5M input tokens (38 %); 3 of the 7 were Opus sessions on orchestration stories (#409 at 7.9M, #449 at 9.2M, #432 at 10.6M input tokens). A lost Opus session therefore counts as part of the cost of the rule. The cause #401 found is a large story worked as one unpushed session, which the checkpoint pushes of `/implement` step 14 address; the executor rule does not.
+- Fix rounds per PR: the 2026-10-15 analysis of the 20 most recent issue PRs (#309–#355) found about 67 Codex P1 findings across 10 PRs, heaviest on #338, #342, #355, #328, #341 and #327, which carried `executor:claude-code-sonnet`; small stories (#347, #340, #323, #313) passed cleanly with Sonnet. The #369 report is not yet available, so these are the baseline; per-PR round counts come from #369. Whether Opus lowers the rounds is measured by `/verify-closure 487` (F3.8), not here.
+
+**ADR-012 assumptions do not change.** ADR-012 rests on one subscription token for the three Claude tiers, one allowance reading before a start, and a PO reserve of the allowance (10 % of the five-hour and 20 % of the weekly window). Opus is an existing tier on the same token, the probe reads the same windows, and the reserve applies to every session, so more Opus sessions draw down the same allowance faster but break none of these assumptions. No ADR is written. `docs/DISPATCHER-CONFIG.md` is not affected: no dispatcher setting changes.
+
+**Rejected:** `executor:codex` for these stories (reviewer and review policy are out of scope) and a new tier (see the Fable decision above).
+
+## Cross-Reference
+
+The canonical executor routing entry points are split by responsibility:
+
+- Status semantics, readiness, WIP pre-flight checks, handoff format, blocker protocol, closure protocol, and OSS compatibility invariants are defined in `docs/PROJECT-STATUS.md`.
+- Adapter boundaries, executor roles, `executor:` labels, and capability profile structure are defined in this file.
+- Lifecycle and source-of-truth rules are defined in `docs/HEADLESS-PR-WORKFLOW.md`.
+
+When adding or changing executor routing, update this file for adapter-facing capability details and update `docs/PROJECT-STATUS.md` only when the workflow contract itself changes. Do not duplicate canonical status or protocol definitions in adapter-specific prompts or commands.

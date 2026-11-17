@@ -1,0 +1,440 @@
+#!/usr/bin/env bash
+# scripts/dispatcher-notify-retry.sh
+#
+# Delivery of the Slack notifications that need PO action (issue #295):
+# decision_blocker, po_blocker, feature_closure_confirmation,
+# epic_closure_approval, evidence_unwritable (issue #372) and
+# dispatch_trigger_stopped (issue #339).
+# Each is retried every dispatcher cycle until it is delivered or the PO no
+# longer needs to act. A failed delivery never aborts the dispatcher.
+#
+# Usage:
+#   bash scripts/dispatcher-notify-retry.sh register --repo <owner/repo> \
+#       --event <event> --issue <n> [--since <iso8601>] --context <json> [--dry-run]
+#   bash scripts/dispatcher-notify-retry.sh run --repo <owner/repo> [--dry-run] [--drain]
+#   bash scripts/dispatcher-notify-retry.sh scan-job-blockers --repo <owner/repo> [--dry-run]
+#
+# register  Records an actionable event as pending (idempotent per event key).
+#           Called by dispatcher-invoke.sh where it used to send directly.
+# run       One delivery cycle: drops resolved events, sends every undelivered
+#           one, records the result. Run by the workflow on every cycle, also
+#           when no story is ready or resumable.
+#
+# scan-job-blockers  (issue #393) Registers one po_blocker event for each open
+#           "## Blocked Declaration" of Type: external or Type: resource that
+#           the codex-review-bookkeeping job posted on the story of an open,
+#           non-draft PR and that no later standalone "/unblock" line from
+#           $DECISION_BLOCKER_PO_LOGIN lifts. The job is stateless by design and
+#           cannot queue the event itself, so the workflow's retry step scans
+#           before it runs. A declaration is the job's when the comment has the
+#           "## Blocked Declaration" heading, a "Declared by:" line equal to the
+#           job's DECLARED_BY and its hidden marker with action=blocker-external
+#           or action=blocker-resource (the constants are read from
+#           headless_pr_workflow.codex_review_bookkeeping, not copied). Only the
+#           latest such declaration of a story counts; <since> is its created_at,
+#           so the scan is idempotent per declaration (register de-duplicates).
+#           A failed read of a PR, a story or its comments skips that story, is
+#           logged as a [NOTIFY] warning and never stops the scan; the next cycle
+#           reads again. Exit 0 when the scan finished; 1 only when a
+#           registration failed (register's own behaviour).
+#
+# run --drain  An extra delivery attempt that dispatcher-invoke.sh makes before
+#           it chains to the next story, so an alert is not held back by hours
+#           of chained sessions. It records a success but never counts a
+#           failure, posts a comment or exits 1: the bound is counted once per
+#           cycle, by the workflow's own run.
+#
+# Event key: <event>:<issue>:<since>. For decision_blocker, <since> is the
+# (and po_blocker, issue #359) the created_at of the "## Blocked Declaration" comment, so a new blocker on the
+# same issue after an earlier one was resolved is a new event.
+#
+# For evidence_unwritable (issue #372) <since> is "<timestamp>:<item>:<ref>" of
+# the missing evidence item, so two items on one story are two events.
+#
+# Resolved (record dropped, even if never delivered):
+#   decision_blocker,     the issue is closed, or the PO ($DECISION_BLOCKER_PO_LOGIN)
+#   po_blocker            posted a standalone "/unblock" line after <since>
+#   closure events        the Feature or Epic issue is closed
+#   dispatch_trigger_stopped  (issue #339, registered with --issue 0 and --since
+#                         the creation time of the newest dispatched run, or
+#                         "none") a workflow_dispatch run of dispatcher.yml on
+#                         main created after <since> exists. A failed lookup
+#                         counts as unresolved. No comment is posted for it
+#                         (there is no issue); a persistent failure only turns
+#                         the run red.
+#   evidence_unwritable   the evidence is posted by the dispatcher's own account
+#                         (the context's resolve_kind says how it is recognised),
+#                         or #348's give-up blocker for the item is on the story.
+#                         A closed story does not resolve it: the cleanup case
+#                         concerns a story that is already Done and closed.
+# A dropped record can be registered again (then it is dropped again by the
+# resolution check before any send), so a delivered event stays suppressed
+# while unresolved and only while unresolved.
+#
+# State (issue #257 mechanism, no second store): one JSON object per line in
+# $DISPATCHER_STATE_DIR/<owner>/<repo>/actionable-events, restored and saved by
+# actions/cache in .github/workflows/dispatcher.yml, read and written only
+# through `hpw dispatcher state` (ADR-014 → Block 3, issue #434), written
+# atomically and only after slack-notify.sh exits 0. Missing state starts empty, silently.
+# Malformed lines are dropped with a warning while valid lines are kept, and a
+# state path that is a directory is moved aside. A state file that exists as a
+# regular file but cannot be read (issue #352) is never overwritten or removed:
+# the events in it stay recoverable. run sends nothing and exits 1 (run --drain
+# only warns and exits 0); register delivers the new event directly and never
+# writes a state file holding only that event.
+#
+# Persistent failure: each cycle in which an undelivered event fails to send
+# adds 1 to its failed_cycles. At 3 the run exits 1 (red) and one comment is
+# posted on the target issue naming the event and the first failed attempt.
+# Later failing cycles stay red but add no comment.
+#
+# Exit codes: 0 all fine or failures still within the bound; 1 a delivery has
+# failed for FAILURE_BOUND cycles in a row; 2 invocation error.
+# Log lines go to stderr as [NOTIFY]; stdout stays empty.
+
+set -uo pipefail
+
+FAILURE_BOUND=3
+DECISION_BLOCKER_PO_LOGIN="${DECISION_BLOCKER_PO_LOGIN:-LauraMardones}"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+STATE_DIR="${DISPATCHER_STATE_DIR:-$REPO_ROOT/.dispatcher-state}"
+HPW_BIN="${HPW_BIN:-$SCRIPT_DIR/hpw}"  # the verified write of ADR-014 (issue #432); overridable for tests
+
+die() { echo "Error: $*" >&2; exit 2; }
+
+[[ $# -ge 1 ]] || die "usage: $0 register|run|scan-job-blockers --repo <owner/repo> ..."
+MODE="$1"; shift
+[[ "$MODE" == register || "$MODE" == run || "$MODE" == scan-job-blockers ]] || die "unknown mode: $MODE"
+
+REPO="" EVENT="" ISSUE="" SINCE="" CONTEXT="" DRY_RUN=false DRAIN=false
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --repo)    [[ $# -ge 2 ]] || die "--repo requires a value"; REPO="$2"; shift 2 ;;
+        --event)   [[ $# -ge 2 ]] || die "--event requires a value"; EVENT="$2"; shift 2 ;;
+        --issue)   [[ $# -ge 2 ]] || die "--issue requires a value"; ISSUE="$2"; shift 2 ;;
+        --since)   [[ $# -ge 2 ]] || die "--since requires a value"; SINCE="$2"; shift 2 ;;
+        --context) [[ $# -ge 2 ]] || die "--context requires a value"; CONTEXT="$2"; shift 2 ;;
+        --dry-run) DRY_RUN=true; shift ;;
+        --drain)   DRAIN=true; shift ;;
+        *) die "unknown flag: $1" ;;
+    esac
+done
+[[ "$REPO" == */* ]] || die "--repo <owner/repo> is required"
+command -v jq >/dev/null 2>&1 || die "'jq' is required"
+
+OWNER="${REPO%%/*}"
+REPO_NAME="${REPO##*/}"
+STATE_FILE="$STATE_DIR/$OWNER/$REPO_NAME/actionable-events"
+TMP_DIR="$(mktemp -d)"
+trap 'rm -rf "$TMP_DIR"' EXIT
+EVENTS="$TMP_DIR/events"   # working copy: one JSON object per line
+
+# ─── State ────────────────────────────────────────────────────────────────────
+
+# state_block <operation> <args...> — Block 3 (`hpw dispatcher state`, ADR-014,
+# issue #434) on this script's state directory. Prints its JSON line.
+state_block() {
+    DISPATCHER_STATE_DIR="$STATE_DIR" "$HPW_BIN" dispatcher state "$@"
+}
+
+# load_state returns 0 when the state is loaded (or missing, or a non-regular
+# path that save_state sets aside) and 2 when the state file is a regular file
+# that cannot be read, or the block gives no answer. The caller must not save
+# over it then (issue #352). A malformed line is dropped with a warning while the
+# valid lines are kept: a closure event is not registered again (issue #338).
+load_state() {
+    : > "$EVENTS"
+    local out result reason dropped
+    out=$(state_block read --name actionable-events --repo "$REPO" 2>/dev/null) || true
+    result=$(jq -r '.result // empty' <<< "$out" 2>/dev/null) || result=""
+    case "$result" in
+        missing) return 0 ;;
+        ok|malformed)
+            jq -c '.data[]' <<< "$out" > "$EVENTS" 2>/dev/null || { : > "$EVENTS"; return 2; }
+            if [[ "$result" == malformed ]]; then
+                dropped=$(jq -r '.dropped // 0' <<< "$out" 2>/dev/null) || dropped=0
+                echo "[NOTIFY] Warning: malformed lines in actionable event state $STATE_FILE; dropped $dropped, kept $(grep -c . "$EVENTS" || true)" >&2
+            fi
+            return 0 ;;
+        unreadable)
+            reason=$(jq -r '.reason // empty' <<< "$out" 2>/dev/null) || reason=""
+            if [[ "$reason" == not-a-file ]]; then
+                echo "[NOTIFY] Warning: cannot read actionable event state $STATE_FILE; continuing with empty state" >&2
+                return 0
+            fi
+            return 2 ;;
+        *) return 2 ;;
+    esac
+}
+
+# save_state returns 1 when the state cannot be written, so a caller never
+# treats an event as recorded when it exists only in the temporary copy. The
+# block writes a temporary file, renames it into place, reads it back, and moves
+# a path that is not a regular file aside to <file>.unreadable.
+save_state() {
+    $DRY_RUN && return 0
+    local out
+    if ! out=$(state_block write --name actionable-events --repo "$REPO" --data-file "$EVENTS" 2>/dev/null); then
+        echo "[NOTIFY] Warning: cannot write actionable event state $STATE_FILE ($(jq -r '.error // "no answer from the state block"' <<< "$out" 2>/dev/null || echo "no answer from the state block"))" >&2
+        return 1
+    fi
+}
+
+# ─── register ─────────────────────────────────────────────────────────────────
+
+if [[ "$MODE" == register ]]; then
+    [[ -n "$EVENT" && "$ISSUE" =~ ^[0-9]+$ && -n "$CONTEXT" ]] \
+        || die "register needs --event, a numeric --issue and --context"
+    jq -e 'type == "object"' <<< "$CONTEXT" >/dev/null 2>&1 || die "--context must be a JSON object"
+    KEY="$EVENT:$ISSUE:$SINCE"
+    if $DRY_RUN; then
+        echo "[DRY RUN] Would register actionable event: $KEY" >&2
+        exit 0
+    fi
+    STATE_UNREADABLE=false
+    load_state || STATE_UNREADABLE=true
+    if $STATE_UNREADABLE; then
+        echo "[NOTIFY] Warning: cannot read actionable event state $STATE_FILE; not changing it, delivering directly: $KEY" >&2
+    elif jq -e --arg k "$KEY" 'select(.key == $k)' "$EVENTS" 2>/dev/null | grep -q .; then
+        exit 0
+    fi
+    jq -nc --arg k "$KEY" --arg e "$EVENT" --argjson i "$ISSUE" --arg s "$SINCE" --arg c "$CONTEXT" \
+        '{key:$k, event:$e, issue:$i, since:$s, context:$c, delivered:false,
+          failed_cycles:0, first_failed_at:"", comment_posted:false}' >> "$EVENTS"
+    if $STATE_UNREADABLE || ! save_state; then
+        # The record cannot be kept for a later cycle, so deliver it now rather
+        # than lose a one-time event; a failed delivery fails the call.
+        if SLACK_WEBHOOK_URL="${SLACK_WEBHOOK_URL:-}"                 bash "$SCRIPT_DIR/slack-notify.sh" "$EVENT" "$CONTEXT" >/dev/null; then
+            echo "[NOTIFY] State not usable; delivered synchronously: $KEY" >&2
+            exit 0
+        fi
+        echo "[NOTIFY] Error: cannot record or deliver actionable event $KEY" >&2
+        exit 1
+    fi
+    echo "[NOTIFY] Registered actionable event: $KEY" >&2
+    exit 0
+fi
+
+# ─── scan-job-blockers (issue #393) ───────────────────────────────────────────
+
+# scan_job_blockers: the job's declarations are posted under the PO's account,
+# so they are read as plain issue comments, not as the dispatcher's own markers.
+scan_job_blockers() {
+    command -v gh >/dev/null 2>&1 || die "'gh' is required"
+    PYTHON_BIN="${HPW_PYTHON:-}"
+    if [[ -z "$PYTHON_BIN" ]]; then
+        PYTHON_BIN=python3; command -v python3 >/dev/null 2>&1 || PYTHON_BIN=python
+    fi
+    # The declaration format is the job's contract: read its constants, never copy them.
+    JOB=$(PYTHONPATH="${HPW_SRC:-$REPO_ROOT/src}${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON_BIN" -c '
+import json
+from headless_pr_workflow import codex_review_bookkeeping as j
+print(json.dumps({"declared_by": j.DECLARED_BY, "marker": j.MARKER_PREFIX,
+                  "actions": [j.ACTION_BLOCKER_EXTERNAL, j.ACTION_BLOCKER_RESOURCE],
+                  "associations": sorted(j.TRUSTED_DECLARER_ASSOCIATIONS)}))' 2>/dev/null) \
+        && jq -e 'type == "object"' <<< "$JOB" >/dev/null 2>&1 \
+        || { echo "[NOTIFY] Warning: cannot read the bookkeeping job's declaration format; job blockers not scanned this cycle" >&2; return 0; }
+
+    prs=$(gh pr list --repo "$REPO" --state open --limit 1000 --json number,isDraft,closingIssuesReferences 2>/dev/null) \
+        && stories=$(jq -r '[.[] | select(.isDraft | not) | .closingIssuesReferences[]?.number] | unique | .[]' <<< "$prs" 2>/dev/null) \
+        || { echo "[NOTIFY] Warning: cannot list open pull requests; job blockers not scanned this cycle" >&2; return 0; }
+
+    SCAN_RC=0
+    for story in $stories; do
+        info=$(gh api "repos/$REPO/issues/$story" 2>/dev/null) && jq -e 'type == "object"' <<< "$info" >/dev/null 2>&1 \
+            || { echo "[NOTIFY] Warning: cannot read #$story; its job blockers are not scanned this cycle" >&2; continue; }
+        [[ "$(jq -r '.state // ""' <<< "$info")" == open ]] || continue
+        comments=$(gh api --paginate "repos/$REPO/issues/$story/comments?per_page=100" 2>/dev/null | jq -s 'add // []' 2>/dev/null) \
+            && jq -e 'type == "array"' <<< "$comments" >/dev/null 2>&1 \
+            || { echo "[NOTIFY] Warning: cannot read the comments of #$story; its job blockers are not scanned this cycle" >&2; continue; }
+        # The latest job declaration, unless a later standalone /unblock line from the PO lifts it.
+        declaration=$(jq -c --argjson job "$JOB" --arg po "$DECISION_BLOCKER_PO_LOGIN" '
+            def lines: (.body // "") | split("\n");
+            def is_job:
+                (.user.login == $po or (.user.type // "") == "Bot" or ((.author_association // "") as $a | $job.associations | index($a)))
+                and (lines | any(. == "## Blocked Declaration"))
+                and (lines | any(. == "Declared by: " + $job.declared_by))
+                and (lines | any(. as $l | $job.actions | any(. as $a | ($job.marker + " action=" + $a) as $m | $l | startswith($m + " "))));
+            ([.[] | select(is_job)] | last) as $d
+            | if $d == null then empty
+              elif any(.[]; .user.login == $po and .created_at > $d.created_at
+                            and (lines | any(test("^\\s*/unblock\\s*$")))) then empty
+              else {since: $d.created_at,
+                    type: (if ($d | lines | any(. == "Type: resource")) then "resource" else "external" end),
+                    unblocked_when: ($d | lines | map(select(startswith("Unblocked when: "))) | first // "" | sub("^Unblocked when: "; "")),
+                    state: ($d | lines | map(select(startswith("State of in-progress work: "))) | first // "" | sub("^State of in-progress work: "; ""))}
+              end' <<< "$comments" 2>/dev/null) \
+            || { echo "[NOTIFY] Warning: cannot evaluate the comments of #$story; its job blockers are not scanned this cycle" >&2; continue; }
+        [[ -n "$declaration" ]] || continue
+        context=$(jq -nc --argjson d "$declaration" --arg st "$(jq -r '.title // ""' <<< "$info")" \
+                         --arg iu "https://github.com/$REPO/issues/$story" \
+                  '{story_title: $st, issue_url: $iu, blocker_type: $d.type,
+                    unblocked_when: $d.unblocked_when, state: $d.state, cause: ""}')
+        args=(register --repo "$REPO" --event po_blocker --issue "$story"
+              --since "$(jq -r '.since' <<< "$declaration")" --context "$context")
+        $DRY_RUN && args+=(--dry-run)
+        bash "${BASH_SOURCE[0]}" "${args[@]}" || SCAN_RC=1
+    done
+    return "$SCAN_RC"
+}
+
+if [[ "$MODE" == scan-job-blockers ]]; then
+    scan_job_blockers
+    exit $?
+fi
+
+# ─── run ──────────────────────────────────────────────────────────────────────
+
+# own_comments_json <issue-or-pr> [<marker>] — the comments of the dispatcher's
+# own account, as one JSON array (`id`, `created_at`, `body`), through Block 2.
+# Fails when the account or the comments cannot be read.
+own_comments_json() {
+    local out
+    out=$("$HPW_BIN" dispatcher marker list --repo "$REPO" --number "$1" ${2:+--marker="$2"} 2>/dev/null) || return 1
+    jq -ec '.comments' <<< "$out" 2>/dev/null
+}
+
+# resolved <event> <issue> <since>: 0 when the PO no longer needs to act.
+# A failed lookup counts as unresolved so the event is never lost to an API error.
+# evidence_resolved <issue> <context-json>: 0 when the missing evidence is posted
+# on its target or #348's give-up blocker for the item is on the story. Only
+# comments of the dispatcher's own account count; any unreadable fact is 1.
+evidence_resolved() {
+    local issue="$1" ctx="$2" target kind text gave own_gave target_comments
+    target=$(jq -r '.target_number // empty' <<< "$ctx" 2>/dev/null) || return 1
+    kind=$(jq -r '.resolve_kind // empty' <<< "$ctx" 2>/dev/null) || return 1
+    text=$(jq -r '.resolve_text // ""' <<< "$ctx" 2>/dev/null) || return 1
+    gave=$(jq -r '.gave_up_marker // empty' <<< "$ctx" 2>/dev/null) || return 1
+    [[ "$target" =~ ^[0-9]+$ && -n "$kind" ]] || return 1
+    # The dispatcher's own comments come from Block 2 (`hpw dispatcher marker list`);
+    # an account or comments that cannot be read leave the event unresolved.
+    if [[ -n "$gave" ]]; then
+        own_gave=$(own_comments_json "$issue" "$gave") || return 1
+        jq -e 'length > 0' <<< "$own_gave" >/dev/null 2>&1 && return 0
+    fi
+    target_comments=$(own_comments_json "$target") || return 1
+    jq -e --arg kind "$kind" --arg text "$text" '
+        def trim: gsub("^\\s+|\\s+$"; "");
+        any(.[]; ((.body // "") | contains("action=evidence-pending") | not)
+            and (if $kind == "merge-gate" then ((.body // "") | test("(^|\n)Merge gate:"))
+                 elif $kind == "cleanup-summary" then ((.body // "") | test("(^|\n)Command: cleanup\n"))
+                 elif $kind == "payload" and $text != "" then ((.body // "") | trim | contains($text | trim))
+                 else false end))' <<< "$target_comments" >/dev/null 2>&1
+}
+
+resolved() {
+    local event="$1" issue="$2" since="$3" ctx="${4:-}" state comments newest
+    if [[ "$event" == dispatch_trigger_stopped ]]; then
+        newest=$(gh run list --repo "$REPO" --workflow dispatcher.yml --branch main \
+            --event workflow_dispatch --limit 1 --json createdAt --jq '.[0].createdAt // ""' 2>/dev/null) \
+            || return 1
+        [[ -n "$newest" ]] || return 1
+        [[ "$since" == none || "$newest" > "$since" ]]
+        return
+    fi
+    if [[ "$event" == evidence_unwritable ]]; then
+        evidence_resolved "$issue" "$ctx"
+        return
+    fi
+    state=$(gh api "repos/$REPO/issues/$issue" --jq '.state' 2>/dev/null) || state=""
+    [[ "$state" == closed ]] && return 0
+    [[ "$event" == decision_blocker || "$event" == po_blocker ]] || return 1
+    comments=$(gh api --paginate "repos/$REPO/issues/$issue/comments?per_page=100" 2>/dev/null | jq -s 'add // []' 2>/dev/null) \
+        || return 1
+    [[ "$(jq -r --arg login "$DECISION_BLOCKER_PO_LOGIN" --arg since "$since" \
+        '[.[] | select((.user.login // "") == $login and .created_at > $since
+              and ((.body // "") | split("\n") | any(test("^\\s*/unblock\\s*$"))))] | length > 0' \
+        <<< "$comments" 2>/dev/null)" == true ]]
+}
+
+if ! load_state; then
+    # Saving now would overwrite the events in the file (issue #352).
+    if $DRAIN; then
+        echo "[NOTIFY] Warning: cannot read actionable event state $STATE_FILE; drain sends nothing and leaves it unchanged" >&2
+        exit 0
+    fi
+    echo "[NOTIFY] Error: cannot read actionable event state $STATE_FILE; nothing sent, file left unchanged" >&2
+    exit 1
+fi
+NEXT="$TMP_DIR/next"
+: > "$NEXT"
+RED=false
+
+while IFS= read -r rec; do
+    [[ -n "$rec" ]] || continue
+    key=$(jq -r '.key' <<< "$rec")
+    event=$(jq -r '.event' <<< "$rec")
+    issue=$(jq -r '.issue' <<< "$rec")
+    since=$(jq -r '.since // ""' <<< "$rec")
+    delivered=$(jq -r '.delivered' <<< "$rec")
+
+    if resolved "$event" "$issue" "$since" "$(jq -r '.context // ""' <<< "$rec")"; then
+        echo "[NOTIFY] Resolved, dropping: $key" >&2
+        continue
+    fi
+    if [[ "$delivered" == true ]]; then
+        echo "$rec" >> "$NEXT"
+        continue
+    fi
+
+    context=$(jq -r '.context' <<< "$rec")
+    if $DRY_RUN; then
+        echo "[DRY RUN] Would notify Slack: $event $context" >&2
+        echo "$rec" >> "$NEXT"
+        continue
+    fi
+
+    if SLACK_WEBHOOK_URL="${SLACK_WEBHOOK_URL:-}" \
+            bash "$SCRIPT_DIR/slack-notify.sh" "$event" "$context" >/dev/null; then
+        echo "[NOTIFY] Delivered: $key" >&2
+        jq -c '.delivered = true' <<< "$rec" >> "$NEXT"
+        continue
+    fi
+
+    if $DRAIN; then
+        echo "[NOTIFY] Warning: Slack delivery failed for $key during drain; the cycle's retry step will try again" >&2
+        echo "$rec" >> "$NEXT"
+        continue
+    fi
+
+    now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    rec=$(jq -c --arg now "$now" \
+        '.failed_cycles += 1 | .first_failed_at = (if (.first_failed_at // "") == "" then $now else .first_failed_at end)' <<< "$rec")
+    cycles=$(jq -r '.failed_cycles' <<< "$rec")
+    echo "[NOTIFY] Warning: Slack delivery failed for $key (failed cycle $cycles of $FAILURE_BOUND); will retry next cycle" >&2
+    if (( cycles >= FAILURE_BOUND )); then
+        RED=true
+        if [[ "$event" != dispatch_trigger_stopped && "$(jq -r '.comment_posted' <<< "$rec")" != true ]]; then
+            first=$(jq -r '.first_failed_at' <<< "$rec")
+            body="## Slack notification not delivered
+The Slack notification \`$event\` for #$issue could not be delivered for $cycles dispatcher cycles in a row (first failed attempt: $first). The dispatcher keeps retrying and Slack will get it as soon as delivery recovers; this issue needs the PO's attention in the meantime. Check the \`SLACK_WEBHOOK_URL\` secret and the Slack webhook."
+            # The verified write (ADR-014 → Block 1, issue #432): the comment is
+            # read back, so success is no longer assumed from the exit code.
+            body_file=$(mktemp) && printf '%s' "$body" > "$body_file" || body_file=""
+            if [[ -n "$body_file" ]] \
+                && "$HPW_BIN" dispatcher write comment --repo "$REPO" --number "$issue" \
+                       --body-file "$body_file" >/dev/null; then
+                rec=$(jq -c '.comment_posted = true' <<< "$rec")
+                echo "[NOTIFY] Posted delivery-failure comment on #$issue" >&2
+            else
+                echo "[NOTIFY] Warning: cannot post delivery-failure comment on #$issue; will retry next cycle" >&2
+            fi
+            [[ -z "$body_file" ]] || rm -f "$body_file"
+        fi
+    fi
+    echo "$rec" >> "$NEXT"
+done < "$EVENTS"
+
+cp "$NEXT" "$EVENTS"
+if ! save_state; then
+    echo "[NOTIFY] Error: actionable event state could not be saved; delivery progress and failure counts are lost for this cycle" >&2
+    exit 1
+fi
+
+if $RED; then
+    echo "[NOTIFY] Error: an actionable Slack notification failed for $FAILURE_BOUND or more cycles in a row" >&2
+    exit 1
+fi
+exit 0

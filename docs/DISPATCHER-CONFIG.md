@@ -1,0 +1,977 @@
+# Dispatcher Configuration Reference
+
+This document covers all configurable variables for the headless PR workflow dispatcher.
+
+---
+
+## Usage limit
+
+The PO caps how many autonomous sessions the dispatcher starts per UTC day with one repository variable (issue #320, ADR-012). It replaces the four daily token caps (`BUDGET_DAILY_*`), the token estimates per story size and the `budget_cap_reached` notification.
+
+| Variable | Valid values | Suggested first value |
+|---|---|---|
+| `USAGE_LIMIT_SESSIONS_PER_DAY` | A whole number of zero or more, in decimal digits only (`08` is eight). `0` means no session starts. | `10` |
+
+**Change it** under **Settings → Secrets and variables → Actions → Variables** (`https://github.com/<owner>/<repo>/settings/variables/actions`). No code change is needed; the new value applies on the next poll that finds work.
+
+**What counts.** Every model session the dispatcher starts counts once, when it starts: `/implement` (including a fix round), `/review` of a Codex-implemented story, and refinement sessions that use the same start function. `/merge` and `/cleanup` are script-only phases (issue #264): they start no model session, so they neither count nor can be stopped by the limit. One full cycle of a Codex-implemented story therefore uses 2 sessions (`/implement` and `/review`), and a Claude-implemented story uses 1 per `/implement` or fix round; size the limit with that in mind. A session that fails, times out or is stopped by a provider limit still counts, so a loop of failing restarts reaches the limit. The allowance probe (#317) does not count, and a start refused by the reserve does not count. Codex Cloud review (ADR-006) is not started by the dispatcher and does not count.
+
+**Where.** `invoke_executor_command()` in `scripts/dispatcher-invoke.sh` checks the limit first and the allowance second, so no probe turn is spent when the limit already stops the session. `scripts/dispatcher-usage-limit.sh` holds the count (`check`, `record`, `status`, `notify-due`, `mark-notified`).
+
+**UTC-day reset.** `.dispatcher-usage/sessions` holds `YYYY-MM-DD:<count>`; a file dated another day reads as 0, and the cache key `session-state-YYYY-MM-DD-<run id>` changes each UTC day. The entry also holds the allowance hold. A lost or evicted cache entry reads as a count of 0, so the limit can be exceeded after a cache loss. The workflow's "Save session state cache" step runs with `always()`, so a failed invoke step is still counted. Caches are scoped by ref, so only scheduled runs and manual runs on the default branch start sessions: a manual `workflow_dispatch` on any other ref runs `dispatcher-invoke.sh` with `--dry-run`, so it neither starts nor counts a session that the scheduled runs could not see.
+
+**Log lines.**
+
+```
+[USAGE LIMIT] 3 of 10 sessions today — start
+[USAGE LIMIT SKIP] #<N>: /<step> not started; 10 of 10 sessions today
+[USAGE LIMIT ERROR] USAGE_LIMIT_SESSIONS_PER_DAY is not set or is not a whole number of zero or more (value: "<value>") — starting nothing
+```
+
+**When the limit stops a session** the story is left where a refusal by the reserve leaves it, the run exits `0` and starts no other session (it does not go on to the next story): before `/implement` nothing is written and the scheduler may choose the story again on a later run; before a fix round nothing is written either, unless the session pushed a new head: then the head is handed off at the pause ([Pause at a provider usage limit](#pause-at-a-provider-usage-limit)); before `/review` one comment starting `## Usage limit` names the step, `N of M sessions today` and the reset time (00:00 UTC), and is not posted again while it is the story's newest comment for that step. A later poll tries `/review` again once the usage limit and the allowance check allow it.
+
+**Notification.** The first stop of a UTC day sets the invoke step output `usage_limit_reached=true`. The workflow step "Notify usage limit reached" runs in the same run, sends one `usage_limit_reached` Slack message (`sessions_today`, `limit`, `settings_url`: the count, the limit and a link to the variables page) and only then writes the day's marker. If the send fails, no marker is written and the next run tries again; a second stop on the same day after a successful send sends nothing. A full retry with a durable record is #295.
+
+**Invalid value.** A missing, empty or invalid value (`abc`, `-1`, `7.5`, `10 `, `1e3`) starts no session. The run log has the `[USAGE LIMIT ERROR]` line, the job fails and no `dispatcher_error` Slack message is sent. Before `/implement` nothing is written; before `/review` the story gets a `## Usage limit` comment.
+
+`--dry-run` neither counts nor notifies and logs `[DRY RUN] Would check usage limit before /<step>`.
+
+---
+
+## WIP and queue limits
+
+The PO sets every WIP and queue limit in repository variables (issue #358). No script holds a number or a default for them, so the dispatcher, the flow review and the docs cannot disagree.
+
+| Variable | Valid values | Suggested value | Read by |
+|---|---|---|---|
+| `WIP_LIMIT_IMPLEMENTATION` | A whole number of one or more, in decimal digits only. The most stories with work in implementation (a draft linked PR or a fix round due) at the same time. | `2` | the [scheduler](#scheduler-new-work-from-github-facts), `scripts/dispatcher-invoke.sh` (Step 5), `scripts/flow-review.sh` (violation, red and yellow status, `WIP count: N/<limit>`) |
+| `READY_BUFFER_MIN` | A whole number of zero or more. The fewest ready stories the scheduler keeps. | `3` | the shared check; the [scheduler](#scheduler-new-work-from-github-facts) uses it for the ready buffer |
+| `READY_BUFFER_MAX` | A whole number, `READY_BUFFER_MIN` or more. The most ready and waiting stories the scheduler keeps. | `5` | the shared check; the [scheduler](#scheduler-new-work-from-github-facts) uses it for the ready buffer |
+
+**Change them** under **Settings → Secrets and variables → Actions → Variables** (`https://github.com/<owner>/<repo>/settings/variables/actions`). No code change is needed; the new value applies on the next run. The workflow passes all three to the "Run dispatcher poll" step (the poll runs the scheduler and `flow-review.sh`) and the "Run dispatcher invoke" step (it runs the scheduler again).
+
+**Board column limits are only visual.** A limit set on a column of the project board is read by nothing. The PO sets it by hand to match the variable.
+
+**The shared check.** `load_limits` in `src/headless_pr_workflow/dispatcher/scheduler.py` is the one check of all three variables (issue #557). `scripts/lib/limits.sh` (`read_limits`) only runs it through `hpw dispatcher admission limits` and reads the result; `dispatcher-invoke.sh` and `flow-review.sh` source it, so a missing or invalid buffer value is found on the first run. The scheduler calls `load_limits` directly and reports `unreadable` for a bad value. Any script that reads a limit uses it instead of its own check.
+
+**Log lines.**
+
+```
+Active WIP count: 2 (limit: 3)
+FAIL: WIP limit reached (3 >= 3)
+WIP count: 2/3
+[LIMITS ERROR] <VARIABLE> is not set or is empty — starting nothing
+[LIMITS ERROR] <VARIABLE> is not a whole number (value: "<value>") — starting nothing
+[LIMITS ERROR] WIP_LIMIT_IMPLEMENTATION must be 1 or more (value: "<value>") — starting nothing
+[LIMITS ERROR] READY_BUFFER_MIN (<min>) is greater than READY_BUFFER_MAX (<max>) — starting nothing
+```
+
+**Unset or invalid value.** There is no fallback to `2`, `3` or `5`. When any of the three is unset, empty or invalid (`abc`, `0` for the WIP limit, `-1`, `2.5`, or a minimum above the maximum), `dispatcher-invoke.sh` starts nothing before it reads the board: no board status is written, no blocker comment is posted and no `dispatcher_error` Slack message is sent; the job fails with the `[LIMITS ERROR]` line, like `[USAGE LIMIT ERROR]`. `flow-review.sh` prints the error to stderr, exits `2` and prints no report or status. `dispatcher-poll.sh` does not hide it: it exits `2`. The dispatcher therefore stops until the PO sets all three variables.
+
+**When the WIP limit is reached** the dispatcher posts a conflict blocker whose "Unblocked when" line names the configured limit (`Fewer than <limit> stories have work in implementation …`). The pre-flight of `scripts/dispatcher-invoke.sh` (Steps 5 and 6, WIP limit and file overlap) passes the facts to `hpw dispatcher admission start`, which applies `wip_reached` and `overlapping_paths` from `dispatcher/admission.py`, the functions `scheduler.choose_next` calls too (issue #557); it counts the same stories as the scheduler's `--in-implementation` list, read fresh from pull request facts right before `/implement`; it reads no board status (issue #478), so a story merged, finished or handed off earlier in the same run no longer counts.
+
+---
+
+## Scheduler: new work from GitHub facts
+
+The dispatcher starts new work from the scheduler's decision, never from a board status (issue #474, ADR-010, Feature #460). Moving a card starts nothing, and the scheduler's choice gets its session whatever its board status. The decision rule is `hpw dispatcher scheduler next` (issue #473); `scripts/dispatcher-poll.sh` and `scripts/dispatcher-invoke.sh` only call it, through `scripts/lib/scheduler.sh`, and act on its result.
+
+```
+scripts/hpw dispatcher scheduler next --repo <owner/repo> --in-implementation <n>[,<n>...] --in-flight <n>[,<n>...] [--exclude <n>[,<n>...]] [--dry-run]
+```
+
+**Codex-assigned stories.** The Actions scheduler never chooses story refinement for an `executor:codex` story, task or bug (`codex-assigned`, a `[SCHEDULER] skip` line): the [local Codex worker](#local-codex-worker) refines it. Feature and Epic refinement stay here.
+
+**Order of actions in a run** (#460 → Decisions "Order of actions in a run"). One model session at a time:
+
+1. work in flight, found from pull request facts (the resume pass: the merge step, fix rounds, pending hand-offs, the review step, conflict rounds; see [Work in flight from PR facts](#work-in-flight-from-pr-facts));
+2. then one scheduler decision for new work. The scheduler orders the rest: re-refinement of stale issues (Epic first), Epic refinement after a new spec merge, Feature refinement, the start of a ready story's implementation, and story refinement for the ready buffer.
+
+**When it is asked.** The poll asks to decide whether the invoke step runs. The invoke step (`dispatcher-invoke.sh --repo <owner/repo>`, no `--issue`) asks again right before it starts new work, after the work in flight, so the decision uses fresh facts. After a finished `/implement` cycle (the hand-off to the Codex review loop), and after a story the run skips as non-executable, the next story also comes from a new scheduler call, not from the board.
+
+**Acting on the result.**
+
+| Result | What the dispatcher does |
+|---|---|
+| `refine #N` | One refinement session for `#N` through the `--refine` path ([Refinement sessions](#refinement-sessions)); the run ends after it, with no chained session. |
+| `implement #N` | `/implement #N` with the usual cycle; the dispatcher writes no board status ([Board status](#board-status--the-only-writer)). A story this run already started or skipped is not started again: the run exits `0`. |
+| `idle` | No new-work session. The run log has `[SCHEDULER] idle`. Exit code unchanged. |
+| `unreadable` | No new-work session. The run log has `[SCHEDULER] unreadable: <error>`. Work in flight in the same run still runs, and the next run (five minutes later, ADR-013) asks again. Exit code unchanged. An output the dispatcher cannot read counts as `unreadable`. |
+
+**The rules** (in the scheduler, issue #473):
+
+- **Ready buffer.** Story refinement starts only while fewer than `READY_BUFFER_MIN` stories are ready and fewer than `READY_BUFFER_MAX` are ready or refined and waiting; otherwise the story is skipped with `buffer-full`.
+- **WIP limit.** No implementation starts while the `--in-implementation` list has `WIP_LIMIT_IMPLEMENTATION` or more stories (`wip-limit`).
+- **File overlap.** A ready story whose `## Files affected` names a file of a listed story is skipped (`file-overlap #<n> <path>`).
+- **No-spec rule.** Nothing under an Epic with no merged spec is refined. The run log carries the scheduler's `[SCHEDULER] skip #<epic> no-merged-spec: <reason>` line; no comment is posted.
+- Every skipped issue gets one `[SCHEDULER] skip #<n> <reason>` line on stderr. The poll and the invoke step pass these lines to the run log unchanged.
+
+**`--in-implementation` and `--in-flight`.** The dispatcher passes two lists, found from pull request facts with no board status read (issue #475; see [Work in flight from PR facts](#work-in-flight-from-pr-facts)). `--in-implementation` lists the stories with an open linked PR that is a draft, or whose current head has a fix round due: they count for the WIP limit and the file overlap. `--in-flight` lists every other story with an open linked PR, and every story with an open non-decision blocker without a later `/unblock`: the scheduler never starts them and refines them only when stale, but does not count them for the WIP limit or the file overlap. So a story in review or in the merge step is never started again, and it no longer holds a WIP slot.
+
+**`--exclude`.** The invoke step lists the stories this run already started or skipped (for example an `executor:codex` story, which the dispatcher does not start). The scheduler never chooses them (`excluded`) and, unlike `--in-implementation`, does not count them for the WIP limit or file overlap, so the next ready story is reached instead of the same one being chosen again.
+
+**No stale rollback (issue #478).** The dispatcher no longer rolls a quiet story back on the board, and it no longer moves a card after the PO's `/unblock` line. Both were board writes only: the scheduler and the resume pass decide from pull request facts and comments, so a story with no linked PR is ready again whatever its card says, and a story with an open PR stays in the scheduler's lists. The board writer shows each story's status from the same facts.
+
+**Gates, unchanged for both kinds.** The pause switch (`DISPATCHER_ENABLED` not `true`: the workflow guard skips the poll and the invoke step, so the scheduler is not called and no session starts), the [usage limit](#usage-limit), the [allowance reserve](#subscription-allowance-and-reserve) and one session at a time (the workflow's `concurrency` group).
+
+**Poll output.** The poll's JSON has `next_issue` (the issue of a `refine` or `implement` action, or `null`), `next_action` (the scheduler's `action` object: `kind`, `issue`, `type`, `epic`, `step`, `reason`; or `null`) and `scheduler_result` (`refine`, `implement`, `idle` or `unreadable`). It no longer has `ready_for_implementation` or `ready_for_refinement`. The workflow's invoke-step condition is unchanged in meaning: the step runs when `next_issue` is set or `resumable` is true.
+
+**Retired.** The `ready_for_refinement` Slack notification and its `notified-refinement` saved state are gone (#460 → Decisions "No stored state is needed"). A leftover `notified-refinement` file in the Actions cache does no harm: nothing reads it, and it expires with the cache.
+
+## Decision rules
+
+The rules that decide the dispatcher's next step, each with its implementations, the entry points that use it, its tests and any suspected disagreement between copies, are listed in [DISPATCHER-DECISIONS.md](DISPATCHER-DECISIONS.md#decision-rules) (issue #555). `src/headless_pr_workflow/dispatcher/rules.py` records the same rules as data.
+
+## Board status — the only writer
+
+The board is a display. One command writes its Status field: `hpw dispatcher status sync` (issue #476, `src/headless_pr_workflow/dispatcher/board_sync.py`). It derives each board item's status from GitHub facts, writes the items that differ and refreshes each Epic's progress section. It is the only writer of board status (issue #478): the dispatcher scripts, the Codex review bookkeeping job and the commands write none, and `tests/test_single_board_writer.py` fails when another tracked file under `scripts/`, `src/`, `.github/` or `.claude/` holds a Status write. Its mutation is in `src/headless_pr_workflow/dispatcher/gateway.py`, the one allowed place.
+
+**When it runs.** `.github/workflows/dispatcher.yml` has a separate `board-status` job with the step "Write the board status". `.github/workflows/board-status.yml` runs the same step on events. Both run `bash scripts/dispatcher-workflow-step.sh status-sync`, which runs `hpw dispatcher status sync --repo <owner/repo>`:
+
+- once per dispatcher run, after the `dispatch` job, with `needs: dispatch` and `if: ${{ !cancelled() && needs.dispatch.outputs.enabled == 'true' }}`;
+- on PR opened, reopened, converted to draft, ready for review, synchronize and closed (merged or not); PR review submitted or dismissed; completion of the `tests` workflow (the required pytest check); issue opened, closed or reopened; and issue or PR comment created. Label changes, body edits and project events start no write;
+- only when `DISPATCHER_ENABLED` is `true` (the guard step); a paused dispatcher writes no status. The writer itself does not read `DISPATCHER_ENABLED`;
+- also when the poll found no work, when the invoke step was skipped and when it failed, so a card moved by hand is corrected on the next run. The `dispatch` job passes the guard and scope outputs to the writer job; no poll or invoke success condition gates it;
+- with `--dry-run` unless `STATE_WRITER=true`: a run off the default branch only reports what it would write, like the poll;
+- with `GH_TOKEN` set to `PROJECT_TOKEN` and a 10-minute timeout.
+
+**Thread-only changes (PO option A, #573).** GitHub supports review thread resolved or unresolved as webhooks, not Actions workflow triggers. The next per-run write corrects these changes; the direct two-minute bound does not apply to thread-only changes. The [PO decision](https://github.com/LauraMardones/headless-pr-workflow/issues/573#issuecomment-6958141308) selects this fallback instead of a webhook bridge. A local fake-transport replay does not establish hosted event-to-board latency. AC 2 requires actual event, workflow queue/start and verified board-write timestamps for a real or recorded story on the hosted path being evaluated. This evidence is required before the implementation handoff; E6 closure also verifies the bound and does not replace implementation acceptance.
+
+**Event latency and serialization.** The board follows each supported event within two minutes, including while a dispatcher session runs: queue time plus one whole-board sync. Both writer jobs share `board-status-${{ github.repository }}` with `cancel-in-progress: false`. The dispatcher run keeps `dispatcher-${{ github.repository }}`; the event workflow has no dispatcher group. GitHub runs one writer at a time, keeps one pending write and replaces an older pending write; every write reads all facts when it starts. Events start no session and leave the five-minute dispatcher trigger unchanged. A queue or sync exceeding two minutes is a decision blocker, not permission for a second writer.
+
+**Event delivery and trusted code.** Dispatcher sessions use `PROJECT_TOKEN`, including git authentication, so their supported PR, review, issue and comment mutations can start workflows. The event writer uses `pull_request_target` for PR changes (including conflicting PRs) and checks out the PR's base branch for PR and review events; it never executes PR head code with `PROJECT_TOKEN`. The scope step uses that base ref too, so reviews targeting the default branch write, and other bases only dry-run. Issue, comment and `workflow_run` events use the default branch. `workflow_run: workflows: [tests], types: [completed]` delivers Actions-created check completions; `check_run` and `check_suite` do not. These triggers require the workflow on the default branch where GitHub specifies it; see [GitHub's event reference](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows) and [token event delivery](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/trigger-a-workflow). The event write step depends on the same guard output (`if: ${{ !cancelled() && steps.guard.outputs.enabled == 'true' }}`), so the pause switch applies to both workflows.
+
+**Exit codes.** The step passes the command's exit code on: `0` (`synced` or `dry-run`) passes; `1` (`failed`), `2` (invalid arguments) and `3` (`unreadable`) fail the step and turn the run red, and the later `!cancelled()` steps still run. Any other code fails the step with `1`. The step prints the command's one JSON line (stdout) and its `[SYNC]` log lines (stderr) unchanged, and no token. A missing Status option is reported per item by the writer (`missing_option`); the dispatcher does not check the options at startup.
+
+**Status options.** The board's Status field holds exactly these options, in this order: No spec, In specification, Not refined, Blocked, Refinement failed, Refined, Ready to implement, In implementation, In review, Mergeable, In progress, Done. `PROJECT_TOKEN` writes item values only; a board admin edits the options in the project settings.
+
+**Migration of the board options.** The board admin carries out four steps in order, in the project settings (the Status field's options). Adding an option keeps the values already on items; deleting one clears it on its items.
+
+1. Before the PR of issue #478 is merged: add the options that do not exist yet (`No spec`, `In specification`, `Not refined`, `Refinement failed`, `Ready to implement`, `Mergeable`, `In progress`), keeping the old ones. `Blocked`, `Refined`, `In implementation`, `In review` and `Done` exist already; add any of them that is missing.
+2. Merge the PR. The first run with `DISPATCHER_ENABLED=true` writes every item, because every old name differs from the derived one.
+3. Check: `hpw dispatcher status sync --repo <owner/repo> --dry-run` lists no difference and no `missing_option`, and the board read-back shows no item on `Backlog`, `Ready for refinement`, `In refinement`, `Ready for implementation` or `In merge`.
+4. Delete those five old options. Record the dry-run JSON line and the option list in the PR or the closure comment.
+
+## Executor Secrets — `CLAUDE_CODE_OAUTH_TOKEN`
+
+The dispatcher needs credentials to start the sessions of the story cycle. There is exactly **one** required secret, not one per `executor:` tier:
+
+| Secret | Type | Covers |
+|---|---|---|
+| `CLAUDE_CODE_OAUTH_TOKEN` | Repository secret | All three Claude tiers (`executor:claude-code-haiku`, `-sonnet`, `-opus`): every Claude session runs Claude Code signed in with the PO's subscription (issue #314, ADR-012). The same secret signs in the allowance probe; see [Subscription token](#subscription-token--claude_code_oauth_token). |
+
+One subscription token serves every Claude tier — Haiku, Sonnet and Opus are model aliases chosen per session, not separate credentials (issue #252 removed the per-tier secrets). The [usage limit](#usage-limit) is one number for all sessions, not per tier.
+
+No metered model-provider API key is used (issue #315 removed the OpenAI path, the last one). The metered Anthropic API key is no longer used. Since issue #314 it is not read by any script and not wired into the workflow; delete the repository secret and revoke the key at the provider (#308 → PO steps). Every `ANTHROPIC_*` variable is removed from the environment Claude Code runs in, so a metered key can never be used even if one is set again.
+
+Provision the secret at:
+
+`https://github.com/<owner>/<repo>/settings/secrets/actions`
+
+The secret must also be explicitly wired into `.github/workflows/dispatcher.yml`'s "Run dispatcher invoke" step `env:` block as `CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}`; it is the only model-provider secret that step names. GitHub Actions never auto-injects a secret into a step's environment — it only becomes visible if the workflow file explicitly references it via `${{ secrets.NAME }}`. This wiring was missing entirely prior to issue #252, so no executor secret of any name ever reached the dispatcher regardless of what was configured in Settings.
+
+**If a secret is absent**, `invoke_executor_command()` in `scripts/dispatcher-invoke.sh` fails closed with `Error: Secret '<name>' is not set in the environment.` before starting the session, and the dispatcher posts a mid-cycle blocker comment on the story issue. A `CLAUDE_CODE_OAUTH_TOKEN` that is empty after whitespace removal counts as absent.
+
+### Executor invocation mechanism
+
+`invoke_executor_command()` resolves the provider and model from the `EXECUTOR_PROVIDER` and `EXECUTOR_MODEL` tables in `scripts/dispatcher-invoke.sh` (data-driven, same pattern as `EXECUTOR_ROUTING`) and loads the task prompt: the `.claude/commands/<slash_command>.md` file with `$ARGUMENTS` substituted — the same instructions a manually-run command follows. Then it starts the session by provider:
+
+| Provider | Executor labels | Session |
+|---|---|---|
+| `claude-code` | `claude-code-haiku`, `-sonnet`, `-opus` | Claude Code on the runner, on the subscription (ADR-012, issue #314) |
+
+`invoke_executor_command()` knows one provider, `claude-code`. An executor label with no `EXECUTOR_PROVIDER` row (`executor:codex` has none) returns non-zero with `Error: No provider/model entry for executor '<label>' in EXECUTOR_PROVIDER/EXECUTOR_MODEL.` and starts nothing. The dispatcher does not start `/implement` for `executor:codex` (no subscription mechanism, ADR-012): see [Review path](#review-path-issues-263-and-293).
+
+This covers every model session the dispatcher starts: `/implement` (also the fix-round `/implement` of the resume pass) and `/review` of a Codex-implemented PR (under `claude-code-opus`). `/merge` and `/cleanup` are **script-only phases** (issue #264): the dispatcher runs `scripts/dispatcher-merge.sh` and `scripts/dispatcher-cleanup.sh` and starts no session for them, in the Claude-tier cycle, and the resume pass in the merge step. They have no executor tier, no allowance check, no executor budget, and no wall-clock session bound. ADR-012's session-start mechanism does not cover them. The step-by-step map to `merge.md` and `cleanup.md` is in [DISPATCHER-MERGE-CLEANUP-MAP.md](DISPATCHER-MERGE-CLEANUP-MAP.md).
+
+#### Claude Code sessions
+
+The session runs in the repository checkout with `GH_TOKEN` inherited, so `git`, `gh` and the repository scripts work as in a manual session. It uses the Claude Code version pinned in the workflow (see [Pinned Claude Code version](#pinned-claude-code-version)), the same install the allowance probe uses. The exact command line, with the task prompt on stdin:
+
+```
+claude -p --output-format stream-json --verbose --permission-mode bypassPermissions \
+  --strict-mcp-config --model <alias> --max-turns "$AGENT_MAX_TURNS"
+```
+
+- **Model aliases.** `EXECUTOR_MODEL` names `haiku`, `sonnet` and `opus`. The pinned Claude Code version decides which model each alias means, so a model change is a deliberate version bump.
+- **Git authentication (issue #337).** The checkout keeps no credentials in git config and has the full history (`fetch-depth: 0`). The step "Configure git to authenticate through gh" runs `gh auth setup-git` with `PROJECT_TOKEN`, so git asks `gh` for credentials: a session's plain `git push`, `git fetch` and `git merge` use `PROJECT_TOKEN`, with no `extraheader` or `credential.helper` override and no `--unshallow`.
+- **Never `--bare`.** Bare mode ignores the OAuth token (ADR-012 → Candidate B).
+- **Flags.** Checked on 2026-10-14 against Claude Code 2.1.295 and against the pinned 2.1.296: each flag above is accepted, and an unknown option is rejected. `--max-turns` is no longer listed in `claude --help` but is still accepted. No flag changed from the issue's command line. The AC19 proof run of #314 then ran two live sessions with these flags on the pinned 2.1.296, with the metered API secrets deleted: [run 38534590704](https://github.com/LauraMardones/headless-pr-workflow/actions/runs/38534590704) (2026-10-14), both `success` with `apiKeySource none`.
+- **Token and environment.** `scripts/lib/claude-session.sh`, shared with the allowance probe, removes every whitespace character from `CLAUDE_CODE_OAUTH_TOKEN` and every variable whose name starts with `ANTHROPIC_` from Claude Code's environment.
+- **Bounds.** `--max-turns` is `AGENT_MAX_TURNS`. The session runs under `timeout` set to the time left of `AGENT_MAX_WALLCLOCK_SECONDS` since `DISPATCH_JOB_START_TS`. When no time is left, the session does not start.
+- **Tools.** `--permission-mode bypassPermissions` allows any command, as the API loop's `bash` tool did. Isolation comes from the fresh GitHub-hosted runner (ADR-012 → Consequences).
+
+The stream-json output is written to a temporary file, parsed by message type (not line order) after the session ends, and deleted before the step returns. The step succeeds only when the stream has a `result` message with `subtype` `success` and `is_error` `false`, and Claude Code exited 0; the `result` text then goes to stdout. Every other outcome fails closed (non-zero return, then the existing mid-cycle blocker or decision-blocker path):
+
+| Outcome | Log line (stderr) |
+|---|---|
+| Wall clock used up before the start | `[SESSION ERROR] /<command> #<n> not started: no time left of AGENT_MAX_WALLCLOCK_SECONDS ...` |
+| `timeout` stopped the session | `[SESSION ERROR] /<command> #<n> stopped by the wall-clock bound ...` |
+| Token rejected (`401`) | `[SESSION ERROR] /<command> #<n>: the subscription token was rejected (401). Run 'claude setup-token' again and save the CLAUDE_CODE_OAUTH_TOKEN secret with nothing before or after the token` |
+| `init` reports an `apiKeySource` other than `none` (or none at all) | `[SESSION ERROR] apiKeySource=<value>; only the subscription token may be used` |
+| A provider usage limit (`rate_limit`) | `[SESSION RATE LIMIT] /<command> #<n> stopped at a provider usage limit; resets <UTC time or unknown>` (exit code 75, a pause, not a failure: see [Pause at a provider usage limit](#pause-at-a-provider-usage-limit)) |
+| Claude Code exits non-zero | `[SESSION ERROR] /<command> #<n>: Claude Code exited with code <rc>`, then the last five lines of its stderr |
+| No `result` message | `[SESSION ERROR] /<command> #<n>: the stream has no result message` |
+| `subtype` other than `success` (for example `error_max_turns`), or `is_error` `true` | `[SESSION ERROR] /<command> #<n>: result subtype <subtype>, is_error <bool>; not treating as success` |
+
+After every session the job log also has one line per tool call and, when the stream has a `result`, one summary line:
+
+```
+[session tool] Bash: git status
+[SESSION] /implement #314 on opus: success, 11 turns, 45 s, apiKeySource none, input 120345 / output 8123 tokens
+```
+
+- A tool line shows the tool name and the first 200 characters of its input: the `command` for `Bash`, the input as JSON for other tools, line breaks replaced by spaces.
+- `input` is the sum of `input_tokens`, `cache_creation_input_tokens` and `cache_read_input_tokens` from the result's `usage`; `output` is `output_tokens`.
+- The token, the full stream and the `init` message (which carries account fields) are never printed. The token value is masked as `[redacted]` in tool lines, in the result text and in the stderr lines shown after a failed exit.
+
+Under `--dry-run` a Claude-provider call logs `[DRY RUN] Would start Claude Code (<alias>) on the subscription for /<command> <target>` and starts nothing.
+
+See [ADR-012](decisions/ADR-012-session-start-mechanism.md) for why sessions start this way: Claude Code on the GitHub Actions runner, signed in with the PO's subscription token, in place of the embedded API loop.
+
+### Review path (issues #263 and #293)
+
+How a story is reviewed is looked up from two tables in `scripts/dispatcher-invoke.sh` (alongside `EXECUTOR_ROUTING`), keyed by the story's `executor:` label. The script does not branch on an executor name anywhere else.
+
+| `/implement` executor label | Review | Table |
+|---|---|---|
+| `claude-code-haiku` | Codex review loop (Codex Cloud, ADR-006) | `CODEX_REVIEW_LOOP_ROUTING` |
+| `claude-code-sonnet` | Codex review loop (Codex Cloud, ADR-006) | `CODEX_REVIEW_LOOP_ROUTING` |
+| `claude-code-opus` | Codex review loop (Codex Cloud, ADR-006) | `CODEX_REVIEW_LOOP_ROUTING` |
+| `codex` | `/review` session under `claude-code-opus` | `REVIEW_EXECUTOR_ROUTING` |
+
+- **Codex review loop.** The dispatcher starts no `/review` session. It hands the story over after `/implement` and resumes it on a later run; see [Codex review loop hand-off and resume](#codex-review-loop-hand-off-and-resume).
+- **Paired session (resume entry).** `invoke_executor_command()` normally resolves the provider and model from the story's own `executor:` label. For the `/review` call of the review entry (see [Review of a Codex-implemented PR](#review-of-a-codex-implemented-pr)) the dispatcher passes a third argument that names the reviewing executor instead, so `/review` runs under a different provider than `/implement`. The session counts once toward the [usage limit](#usage-limit), whichever executor runs it.
+- **Neither table.** An executor label with no row in either table gets a mid-cycle blocker after `/implement`.
+
+The path is computed from the story's existing `executor:` label and is never written back to the issue. The label continues to mean "the `/implement` executor" only.
+
+This is specific to the dispatcher's own invocation path. The manually-invoked `/review` command (`.claude/commands/review.md`, run by a human or an interactive session) reads neither table and its reviewer choice is unchanged.
+
+Session tuning is overridable via environment variables (defaults shown), primarily for tests:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `AGENT_MAX_TURNS` | `60` | Turns before failing closed: Claude Code's `--max-turns` |
+| `AGENT_MAX_WALLCLOCK_SECONDS` | `10800` (3h) | Total elapsed budget for the whole Actions job (shared across `/implement`/`/review` sessions and any chained stories via `DISPATCH_JOB_START_TS`; the script-only `/merge` and `/cleanup` start no session and are not bounded by it, not reset per call) — the enforced bound against GitHub Actions' 6h job ceiling (see ADR-003). A Claude Code session runs under `timeout` set to the time left. |
+| `CLAUDE_BIN` | `claude` | The Claude Code binary, for the sessions and the allowance probe (test hook) |
+
+---
+
+## GitHub Token — `PROJECT_TOKEN`
+
+The dispatcher workflow (`.github/workflows/dispatcher.yml`) and the Codex review bookkeeping workflow (`.github/workflows/codex-review-bookkeeping.yml`) require a **repository secret named `PROJECT_TOKEN`** — not the built-in `GITHUB_TOKEN`. The built-in `GITHUB_TOKEN` does not receive the `project` permission for user-owned GitHub Projects v2 boards. With it, the `repository.projectsV2` GraphQL query returns an empty list, `scripts/dispatcher-poll.sh` exits with `Error: No GitHub Projects (v2) board linked to <repo>`, and no board status can be written.
+
+Provision a **classic personal access token (PAT)** with the scopes below and store it as a repository secret (not a variable) named `PROJECT_TOKEN`:
+
+`https://github.com/<owner>/<repo>/settings/secrets/actions`
+
+This table is the only list of the token's scopes. Other documents and comments link here instead of repeating it.
+
+| Scope | Reason |
+|---|---|
+| `repo` | Read and write access to repository contents, issues and pull requests: every `gh` read, comment, PR update and merge, and the `resolveReviewThread` mutation with which the Codex review bookkeeping job resolves superseded Codex review threads. |
+| `project` | Read and write access to the Projects v2 board. The full scope is needed because the board writer (`hpw dispatcher status sync`) writes story status with `updateProjectV2ItemFieldValue`; read-only project access cannot move a board item. |
+| `workflow` | GitHub refuses a merge or push from a classic PAT without this scope when the change touches a file under `.github/workflows/`. Dispatcher-started sessions run `gh` with this token. |
+| `read:org` | Needed by the PR read of every `hpw` command (`fetch_pr_context()` in `src/headless_pr_workflow/github/pr_context.py`), including `hpw codex-review-bookkeeping` and `scripts/merge-gate-summary`. The read asks `gh pr view --json` for `reviewRequests`, and for that field `gh` requests a team's `name` and `slug` and its organisation's `login`. GitHub checks the token for this scope even when the PR has no team review request and the repository belongs to a user account. |
+
+Both workflows map the secret to the `GH_TOKEN` environment variable (`GH_TOKEN: ${{ secrets.PROJECT_TOKEN }}`), which `scripts/dispatcher-invoke.sh` and `scripts/dispatcher-poll.sh` read via `GH_TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-}}"`. No other changes to the scripts are needed.
+
+A dispatcher-started session also pushes with this token: its `git push` goes through `gh auth setup-git` (issue #337), so the `repo` and `workflow` scopes above cover the push, with no new scope.
+
+The Codex review bookkeeping job resolves review threads with this token (`resolveReviewThread`, see [Codex review loop](HEADLESS-PR-WORKFLOW.md#codex-review-loop)). GitHub's GraphQL reference for the mutation names the classic `repo` scope (`public_repo` for a public repository), which the table already lists, so no scope is added. This was confirmed from that reference, not by a live call: the first run with a thread to resolve is the live confirmation, and a refused call exits non-zero naming the missing scope.
+
+### Token of each step in a dispatcher-started session
+
+The token of a dispatcher-started session is `PROJECT_TOKEN`: the workflow sets `GH_TOKEN: ${{ secrets.PROJECT_TOKEN }}` and `scripts/lib/claude-session.sh` removes only the variables whose names start with `ANTHROPIC_`, so the session keeps it (pinned by `tests/test_dispatcher_claude_session.py`). The three steps that need `gh` with GraphQL all use it (issue #318):
+
+| Step | Token | Scope that matters | Evidence |
+|---|---|---|---|
+| `scripts/ac-summary.sh` | `PROJECT_TOKEN` | `repo` | [Dispatcher run 41206624527](https://github.com/LauraMardones/headless-pr-workflow/actions/runs/41206624527/job/124552899111#step:12:84): exit `2` (issue read, no checkbox list) in the `/implement #344` session |
+| Review-thread resolution (`resolveReviewThread`) | `PROJECT_TOKEN` | `repo` | Bookkeeping job (Actions): [run 41342523068](https://github.com/LauraMardones/headless-pr-workflow/actions/runs/41342523068/job/124955357930#step:4:40) resolved a thread on PR #424 |
+| `scripts/merge-gate-summary` | `PROJECT_TOKEN` | `repo`, `read:org`, and **admin access** to read branch protection | [Dispatcher run 41350157331](https://github.com/LauraMardones/headless-pr-workflow/actions/runs/41350157331/job/124979233267#step:12:35): `Merge gate: … checks=pass` for PR #430 |
+
+All three were proven on the runner in ordinary runs (issue #414); the evidence is on [#308](https://github.com/LauraMardones/headless-pr-workflow/issues/308#issuecomment-6584021065).
+
+The merge gate reads `repos/<repo>/branches/main/protection`, which GitHub allows only with admin access to the repository. A token without it makes the gate report `checks=fail(required-unavailable)` and `/merge` stops. The built-in `GITHUB_TOKEN` of a job does not have it. If the proof run shows that `PROJECT_TOKEN` cannot read it, the PO picks the token that can (for example a fine-grained token with "Administration: read"); the gate is not weakened.
+
+**Board status.** A session writes no board status (issue #477). The board writer step uses `PROJECT_TOKEN` and its `project` scope ([Board status](#board-status--the-only-writer)).
+
+**If the secret is absent**, the `gh` CLI fails to authenticate, the workflow exits with an error on the first API call and no story is dispatched.
+
+**If a scope is missing**, GitHub refuses the query that needs it. `hpw codex-review-bookkeeping` then exits non-zero and its error names the failed step, the missing scope and this section (see [Codex review loop](HEADLESS-PR-WORKFLOW.md#codex-review-loop) → Failure).
+
+---
+
+## GitHub writes — `hpw dispatcher write`
+
+Every comment and label the dispatcher writes goes through one building block, `scripts/hpw dispatcher write` (ADR-014 → Block 1, issue #432; code in `src/headless_pr_workflow/dispatcher/`). It runs `gh` with the token above, writes, reads the result back from GitHub and retries. A write that is not confirmed by the read-back is a failure, never a success.
+
+```
+scripts/hpw dispatcher write comment      --repo <owner/repo> --number <n> --body-file <path> [--attempts <n>] [--evidence-item <item> --evidence-head <sha|->] [--dry-run]
+scripts/hpw dispatcher write board-status --repo <owner/repo> --issue <n> --status "<name>" [--attempts <n>] [--dry-run]
+scripts/hpw dispatcher write label        --repo <owner/repo> --number <n> (--add|--remove) <name> [--attempts <n>] [--dry-run]
+scripts/hpw dispatcher write retry-pending --repo <owner/repo> --target <n> --item <item> --ref <ref> --story <n> [--expected-head <sha>] [--dry-run]
+```
+
+- **stdout:** one JSON line, on success and on failure: `ok`, `block`, `operation`, `result`, `error` (`"<step>: <reason>"` or `null`), and per operation `url`, `created_at`, `attempts`, or `before`/`after` and `sent` for a board status (`sent` is `true` when a status mutation was sent, so a failed write may still have changed the board).
+- **Exit codes:** `0` `written`, `already` or `dry-run` (`retry-pending`: `none`, `posted`); `1` `pending`, `failed`, `missing` or `stale`; `4` `retry-pending` stopped until the PO's `/unblock` (`gave-up`); `2` invalid arguments. A write never exits `3`.
+- **Bounds:** at most `--attempts` tries (default 3), `COMMENT_RETRY_DELAY` seconds apart (default 2). A comment is posted at most once per call: before a retry the block looks for an identical comment of the dispatcher's own account that was not there before the first try. The comment body is sent on stdin (`gh api --input -`), never on the command line.
+- **Evidence:** with `--evidence-item`, a comment that still fails is left as the evidence-pending comment of issue #348 (up to 3 more tries) and the result is `pending`. `retry-pending` posts that text on a later run, counts a failed run on the story, and returns `gave-up` when `EVIDENCE_RETRY_MAX` (default 3) is reached; the bash caller then posts the give-up blocker.
+- **The token** and request headers are never printed.
+
+The bash functions callers use (`post_comment`, `evidence_retry`, `label_pending_cleanup`) are thin shims around the block in `scripts/dispatcher-invoke.sh`; `HPW_BIN` (default `scripts/hpw`) names the `hpw` to run, as in `dispatcher-merge.sh`. `dispatcher-merge.sh`, `dispatcher-cleanup.sh` and `dispatcher-notify-retry.sh` call the block directly. Each call is a separate process, so a merged change to the block takes effect on the next call (see [The dispatcher script is read completely before any session starts](#the-dispatcher-script-is-read-completely-before-any-session-starts)).
+
+`hpw` runs from the run's start commit (issue #497). A session leaves its story branch checked out, and `scripts/hpw` runs the `src/` of the checkout it sits in, so without a pin the scheduler calls after `/implement` would decide with the branch's older code. When `HPW_BIN` is unset, `scripts/dispatcher-invoke.sh` exports `scripts/hpw` and `src/` of the checkout's `HEAD` (`git archive`) into a temporary directory at the start of the run, logs `hpw is pinned to the run's start commit <sha>`, and uses that copy for every `hpw` call of the run, including `scripts/lib/scheduler.sh`. The directory name travels in `DISPATCH_HPW_PIN_DIR`, so an `exec bash "$0"` restart keeps the same start commit; the process that exits for good removes it. When the copy cannot be made the run exits 1 before any session starts and names the reason on stderr. The checkout, its branch and the story's files are not changed; other scripts the run starts from the checkout are not pinned. A non-empty `HPW_BIN` (tests) is used as given.
+
+**No board status write.** `scripts/dispatcher-invoke.sh` writes no board status (issue #478). The `write board-status` operation stays for the board writer's own building block; no dispatcher script calls it. A hand-off, fix round, merge, finish or review step reaches its end state by markers and PR facts.
+
+**Change check.** `scripts/dispatcher-change-check.sh` has the check id `verified-write`: a `gh api` call with a write method, `-f body=` or `--input`, a GraphQL `mutation`, `gh issue|pr comment|edit|close|reopen|ready|merge|review`, `gh label`, or `curl` with a write method fails the check outside the shims above. It also checks the `scripts/lib/*.sh` files the dispatcher sources. Its exceptions are an allowlist of function name and check id in the script, one per "stays" row of ADR-014 → Decision → 7.
+
+## Markers — `hpw dispatcher marker`
+
+Every hidden dispatcher marker (`<!-- hpw:dispatcher action=<action> key=value ... -->`) is written and read through one building block, `scripts/hpw dispatcher marker` (ADR-014 → Block 2, issue #433). A marker counts only on a comment whose `user.login` is the account that should have written it, so a marker pasted by anyone else never stops a fix round, writes a board status or starts a merge.
+
+```
+scripts/hpw dispatcher marker write  --repo <owner/repo> --number <n> --action <action> [--field key=value ...] [--body-file <path>] [--once] [--attempts <n>] [--dry-run]
+scripts/hpw dispatcher marker holds  --repo <owner/repo> --number <n> --marker <text-or-prefix> [--cancel <marker>] [--author dispatcher|bookkeeping]
+scripts/hpw dispatcher marker list   --repo <owner/repo> --number <n> [--marker <m>] [--author dispatcher|bookkeeping]
+scripts/hpw dispatcher marker whoami --repo <owner/repo>
+```
+
+- **Accounts:** resolved once per process. `dispatcher` is `DISPATCHER_LOGIN` or the login behind `GH_TOKEN`; `bookkeeping` is `CODEX_BOOKKEEPING_LOGIN` or the same login. `--author` defaults to `dispatcher`.
+- **`holds`:** the newest own comment carrying the marker (a substring, so a prefix works) holds unless a later standalone `/unblock` line from `DECISION_BLOCKER_PO_LOGIN`, or a later own comment carrying `--cancel`, follows it. Result words: `holds` (exit `0`), `absent`, `unblocked`, `cancelled` (exit `1`), `unreadable` (exit `3`).
+- **`write`:** posts the marker (after the text of `--body-file`, when given) through the verified write above, read-back included. With `--once` it posts nothing and reports `already` when the same marker holds; when the markers cannot be read it posts nothing and reports `failed`. The marker text is unchanged, so markers already on GitHub stay valid.
+- **`list`:** the own comments (`id`, `created_at`, `body`), optionally only those carrying `--marker`. **`whoami`:** `dispatcher` and `bookkeeping`.
+- **Fail closed:** a login that cannot be resolved (`gh api user` fails or returns an empty login, and `DISPATCHER_LOGIN` is unset) or comments that cannot be read give `unreadable` (exit `3`); no comment from any author then matches. The bash shim `marker_holds <issue> <marker> <on-read-error> [<cancel>]` needs the caller's direction as a mandatory `0` (treat as held) or `1` (treat as absent): a caller that stops when the marker holds passes `0`, one that acts when it holds passes `1`, so a failed read starts no session, posts no second blocker, writes no board status and merges nothing.
+- **Output:** one JSON line on stdout (`ok`, `block: "marker"`, `operation`, `result`, `error`, plus `url`/`created_at` for `holds`, `comments` for `list`, `dispatcher`/`bookkeeping` for `whoami`); log lines on stderr; the token is never printed. Exit `2` is invalid arguments.
+
+The bash functions callers use (`marker_holds`, `resolve_dispatcher_login`, `bookkeeping_login`, `bot_comments_json`, `marker_list_json`, `newest_own_comment_body`, the CLAIM/CONFIRM helpers of the decision-blocker resume) are thin shims in `scripts/dispatcher-invoke.sh`; `dispatcher-merge.sh` reads the owner marker with `holds`, `dispatcher-notify-retry.sh` reads the evidence with `list`, and `dispatcher-poll.sh` takes its login from `whoami`. The "already the newest comment" checks of the allowance, usage-limit and pause comments look at the newest comment of the dispatcher's own account.
+
+**Change check.** `scripts/dispatcher-change-check.sh` has the check id `own-marker`: outside the shims above it flags a literal `hpw:dispatcher` or `hpw:codex-review-bookkeeping`, a `gh api user` or `/user` call, a jq filter on `.user.login`, and a match on `DECISION_BLOCKER_CLAIM_MARKER` or `DECISION_BLOCKER_RESUME_MARKER`. It covers `scripts/dispatcher-*.sh` and `scripts/lib/*.sh`. Its exceptions are an allowlist of function name and check id, one per "stays" row of ADR-014 → Decision → 7.
+
+## Saved state — `hpw dispatcher state`
+
+The state the dispatcher keeps between runs is read, checked and written through one building block, `scripts/hpw dispatcher state` (ADR-014 → Block 3, issue #434). A broken file is never used as if it were good and never overwrites good state, and a cancelled or re-run workflow does not lose state.
+
+```
+scripts/hpw dispatcher state read         --name <name> [--repo <owner/repo>]
+scripts/hpw dispatcher state write        --name <name> --data-file <path> [--repo <owner/repo>] [--dry-run]
+scripts/hpw dispatcher state read-pending --number <n> --item <item> [--expected-head <sha>] --repo <owner/repo>
+```
+
+| Name | File (formats and paths unchanged) | Malformed or unreadable |
+|---|---|---|
+| `actionable-events` | `.dispatcher-state/<owner>/<repo>/actionable-events` (`DISPATCHER_STATE_DIR`) | the retry step sends nothing and leaves the file; a malformed *line* is dropped while valid lines are kept; a new event is delivered directly |
+| `red-flow-notified` | `.dispatcher-state/<owner>/<repo>/red-flow-notified` (`DISPATCHER_STATE_DIR`; `sent` or `clear`) | `dispatcher-poll.sh` counts it as not sent and sends `red_flow_health` again; a failed write only logs a `[POLL] Warning:` and never stops the poll |
+| `usage-sessions` | `.dispatcher-usage/sessions` (`YYYY-MM-DD:<count>`, `USAGE_LIMIT_STATE_DIR`) | **starts no session**: `[USAGE LIMIT ERROR]`, exit `2`. A file dated another day is the normal start of a new day: 0 sessions |
+| `usage-notified` | `.dispatcher-usage/notified` (`YYYY-MM-DD`) | the notification is sent again |
+| `allowance-hold` | `.dispatcher-allowance/hold.json` (`ALLOWANCE_STATE_DIR`) | the allowance check probes again |
+
+- **`read`** never changes the file. Result words and exit codes: `ok`, `missing` (the name's empty value) exit `0`; `malformed`, `stale` (another day, for the two day files) exit `1`; `unreadable` (not a regular file, or it cannot be read) exit `3`. `read` prints `reason` (`not-a-file` or `read-failed`) for `unreadable`.
+- **`write`** checks the data against the name's format, writes a temporary file, renames it into place and reads it back (`written`, exit `0`; `failed`, exit `1`, with one stderr line naming the file and the step). A path that is not a regular file, or a file that cannot be read, is moved aside to `<file>.unreadable` and never overwritten. A write stopped before the rename leaves the old file whole. `--dry-run` writes nothing and returns `dry-run`.
+- **`read-pending`** finds the dispatcher's own evidence-pending comment through Block 2 and returns `none`, `ok` (with `payload`), `stale-head` (the payload was recorded for another head), `malformed` or `unreadable`. `write retry-pending` reads its payload through it.
+- **Output:** one JSON line (`ok`, `block: "state"`, `operation`, `result`, `name`, `data` or `payload`, `error`); exit `2` is an unknown name or invalid arguments. The block adds no wait and no retry.
+- The bash callers are thin shims: `load_state` and `save_state` in `dispatcher-notify-retry.sh`, `read_count`, `record`, `notify-due` and `mark-notified` in `dispatcher-usage-limit.sh`, and the hold in `dispatcher-allowance.sh`.
+
+**Workflow rules** (`.github/workflows/dispatcher.yml`): every `actions/cache/save` key contains `${{ github.run_id }}-${{ github.run_attempt }}`, so a re-run never collides with the first attempt, and restores match by prefix, so the newest snapshot wins; every state save has `always()` in its `if:`, so it also runs after a failed or cancelled step; only the state writer (a scheduled run, or a run on the default branch) saves `.dispatcher-state`, and other refs run the poll, invoke, trigger-check and retry steps with `--dry-run`.
+
+**Workflow steps are scripts.** Every `run:` in `dispatcher.yml` is one command: `bash scripts/dispatcher-workflow-step.sh <step>`, or the pinned `npm install`. The step script holds the guard (`guard`), the state-writer rule (`scope`), the cache dates (`cache-date`, `cache-save-date`), `gh auth setup-git` (`git-auth`), the `--dry-run` and `--refine` choices (`poll`, `invoke`, `trigger-check`, `retry`, which scans the bookkeeping job's blockers before it delivers) and the usage-limit notification context (`usage-limit-notify`). The poll reports `next_issue`, `next_action`, `scheduler_result`, `evidence_pending` and `resumable` in its JSON; a failed read of the `evidence:pending` label counts as pending.
+
+**Change check.** `scripts/dispatcher-change-check.sh` has the check id `saved-state`: outside the shims above it flags a redirect, `cp`, `mv`, `rm`, `cat`, `read <` or `mkdir` on a path under `.dispatcher-state`, `.dispatcher-usage` or `.dispatcher-allowance`, or on a variable named `*STATE_DIR`, `*STATE_FILE`, `HOLD_FILE`, `SESSIONS_FILE` or `NOTIFIED_FILE`. On `dispatcher.yml` it flags an `actions/cache/save` key without `github.run_attempt`, a cache save whose `if:` has no `always()`, and a `run:` step that calls `gh` directly.
+
+## Slack Notifications
+
+The dispatcher sends Slack notifications through `scripts/slack-notify.sh` for these events. There are no "story dispatched" or "closed" events: normal transitions are not notified.
+
+| Event | Sent when | Retried |
+|---|---|---|
+| `decision_blocker` | a session left a `Type: decision` blocker, whether it failed or exited 0 (a first or fix-round `/implement`, or a `/review` of a Codex-implemented story, that leaves an Out of scope finding waiting for the PO's waiver) | yes |
+| `po_blocker` | the dispatcher posted a blocker only the PO can resolve (issue #359): fix-round maximum, evidence retry given up, a failed or no-progress `/implement`, `/review` or `/merge`, or a PR that changes decision documents and waits for the PO's personal merge (issue #502, below); also every `Type: external` or `Type: resource` blocker the Codex review bookkeeping job posts (issue #393, found by the scan below) | yes |
+| `evidence_unwritable` | required merge or cleanup evidence has been missing for 15 minutes and the story's comments cannot be written, so #348's blocker cannot be posted (issue #372) | yes |
+| `feature_closure_confirmation` | all stories of a Feature are Done, except the standing catch-all Feature (`catch_all.py`) | yes |
+| `epic_closure_approval` | all Features of an Epic are Done, except the standing catch-all Epic (`catch_all.py`) | yes |
+| `red_flow_health` | the board turns Red (once per Red period, issue #596) | no queue: not recorded as sent after a failed delivery, so the next poll tries again while the board is Red; a change of the Red signal sends nothing and a long Red period gets no reminder |
+| `budget_cap_reached` | every ready story is budget-blocked | no |
+| `dispatcher_error` | the invoke run exited unexpectedly | no: the failing run is itself red |
+| `dispatch_trigger_stopped` | the newest `workflow_dispatch` run of `dispatcher.yml` on `main` is more than 15 minutes old, or none exists (issue #339, [Dispatcher trigger](#dispatcher-trigger)) | yes, until a newer dispatched run exists |
+
+**Retry of notifications that need PO action (issue #295).** `dispatcher-invoke.sh` queues `decision_blocker`, `po_blocker`, `evidence_unwritable`, `feature_closure_confirmation` and `epic_closure_approval`, and `scripts/dispatcher-trigger-check.sh` queues `dispatch_trigger_stopped` (issue #339; it is resolved when a newer dispatched run exists, uses issue `0` and never posts an issue comment, so a persistent delivery failure only turns the run red), in `$DISPATCHER_STATE_DIR/<owner>/<repo>/actionable-events` (restored and saved by the `actions/cache` steps of [Dispatcher state cache](#dispatcher-state-cache)). The workflow step **Retry actionable Slack notifications** first runs `scripts/dispatcher-notify-retry.sh scan-job-blockers` (issue #393) and then `scripts/dispatcher-notify-retry.sh run`. The scan registers one `po_blocker` event for the latest `Type: external` or `Type: resource` blocker that the `codex-review-bookkeeping` job posted on the story of each open non-draft PR (the `## Blocked Declaration` heading, the job's `Declared by:` line and its hidden marker with `action=blocker-external` or `action=blocker-resource`, read from the job's own constants) unless a later standalone `/unblock` line from the PO lifts it or the story is closed; the key uses the declaration's `created_at`, so a declaration is queued once and a later one is a new event. A failed read of a PR, story or its comments skips that story with a `[NOTIFY] Warning:` and never prevents `run`; under `--dry-run` it only logs `[DRY RUN] Would register actionable event`. The `run` half runs on every cycle, also when no story is ready or resumable, sends each undelivered event and records it as delivered only after `slack-notify.sh` exits 0. A delivered event is not sent again while it stays unresolved. An event stops being retried, even if it was never delivered, when it is resolved: a decision blocker or `po_blocker` by a `/unblock` line from the PO after the declaration or by closing the issue, a closure event by closing the Feature or Epic, `evidence_unwritable` when the evidence is posted by the dispatcher's own account or #348's give-up blocker for the item is on the story (a closed story does not resolve it, because the cleanup case concerns a story that is already `Done`). A new decision blocker or `po_blocker` on the same issue is a new event (the key is the `created_at` of the declaration comment). `po_blocker` is queued by `post_blocker_once` and `post_mid_cycle_blocker` for every `Type: resource` or `Type: external` blocker the dispatcher posts; `Type: conflict` blockers (WIP limit, file overlap) clear on their own and send nothing. After a session that exits 0 the event is queued only while the blocker is open, that is, no later PO comment has a line that is exactly `/unblock` (the rule of `docs/PROJECT-STATUS.md`, Decision blockers); the state de-duplicates a re-run over the same declaration (issue #357). A blocker the dispatcher does not post again because its marker still holds queues no second event. Before `dispatcher-invoke.sh` chains to the next story, and after each story the resume pass handles (the merge step, fix rounds, pending hand-offs, the review step; issue #349), it makes one extra delivery attempt (`run --drain`), so an alert is not held back by the chained or later resumed sessions or by the `/implement` session that follows the resume pass; that attempt records a success but never counts a failure. If the state file cannot be written, `register` delivers the event synchronously instead and exits non-zero when that fails too, and the retry step ends the run red with an `[NOTIFY] Error:` line. A state file that exists as a regular file but cannot be read (issue #352) is never overwritten or removed, because the events in it stay recoverable: `run` sends nothing, leaves the file unchanged, writes an `[NOTIFY] Error:` line and exits 1; `run --drain` writes a `[NOTIFY] Warning:` line and exits 0; `register` delivers the event directly (exit 0 on success, 1 on failure) and writes no state file. Once the file is readable again the next `run` delivers what it holds. When `register` exits non-zero, `dispatcher-invoke.sh` carries on with its loop, writes an `Error:` line naming the event type and issue number, and exits 1 at its end, also across a chained `exec`; this is not reported as `dispatcher_error`. The steps after the invoke step (usage-limit notice, session-state save, retry, state save) still run. The `.dispatcher-state` cache is also saved when the job is cancelled, so an event queued during the invoke step survives; the save keeps its guards (enabled, successful poll, default-branch state writer).
+
+**Bound and red run.** A failed delivery never aborts the dispatcher; the step exits 0 and retries on the next cycle. After 3 failed cycles in a row (about 15 minutes) the step exits 1, so the run ends red, and one comment is posted on the affected issue naming the event and the first failed attempt. Later failing cycles stay red but add no comment, and Slack still receives the message when it recovers. Missing state starts empty; in a malformed state file only the malformed lines are dropped and valid records are kept; a state file that exists but cannot be read is left unchanged and makes `run` red (see above). Under `--dry-run` nothing is sent, recorded or commented. A manual run on a non-default ref only reports what it would send; an event queued in such a run is not saved and is not delivered.
+
+To enable notifications, add `SLACK_WEBHOOK_URL` as a **repository secret** (not a variable):
+
+`https://github.com/<owner>/<repo>/settings/secrets/actions`
+
+| Secret | Required value |
+|---|---|
+| `SLACK_WEBHOOK_URL` | Incoming webhook URL from your Slack app (format: `https://hooks.slack.com/services/...`) |
+
+The dispatcher workflow passes this secret to the shell environment automatically — no changes to workflow files are needed beyond what is already wired.
+
+**If the secret is absent or invalid**, `slack-notify.sh` exits with code 1 and a missing webhook never aborts the dispatch work. The non-retried notifications (`budget_cap_reached`, `dispatcher_error`) fail silently and the run continues normally. The retried actionable events stay queued: after 3 failed cycles in a row the **Retry actionable Slack notifications** step turns the run red and comments once on the affected issue, until the secret is fixed.
+
+`.github/workflows/codex-review-bookkeeping.yml` also reads `SLACK_WEBHOOK_URL`, in its notify step only, to send a `dispatcher_error` message when a bookkeeping run fails (at most one a day while the failure lasts; see `HEADLESS-PR-WORKFLOW.md` → "Codex review loop"). A missing secret there is a warning, not a failure of its own.
+
+For local development, copy `.env.example` to `.env` and set your webhook URL there. `.env` is listed in `.gitignore` and must not be committed.
+
+### Dispatcher state cache
+
+GitHub-hosted runners are ephemeral, so `.github/workflows/dispatcher.yml` persists `.dispatcher-state/` (the `actionable-events` state above and `red-flow-notified`, which keeps `dispatcher-poll.sh` from repeating `red_flow_health` while the board stays Red) with `actions/cache`. The step names come from issue #257, when the cache held the retired refinement-notification state (issue #474):
+
+1. **Restore refinement notification state** runs before **Run dispatcher poll** on every enabled run. Its `dispatcher-state-` prefix restores the most recently saved snapshot.
+2. **Save poll notification state** and **Save refinement notification state** save it on every enabled default-branch run after a successful poll. Cache entries are immutable, so each save uses a unique key with `<run_id>-<run_attempt>`.
+3. **Default branch only writes state.** Actions caches are scoped by ref, so **Resolve notification state scope** marks every scheduled run, and every manual run dispatched on the default branch, as the state writer. A manual `workflow_dispatch` on any other ref restores the default-branch snapshot and runs the poll, invoke, trigger-check and retry steps with `--dry-run`; the save steps are skipped.
+4. A workflow-level `concurrency` group (`dispatcher-<owner>/<repo>`, `cancel-in-progress: false`) serializes scheduled and manual runs, so no two runs read the same snapshot and race to write it.
+
+**Interim mechanism:** this cache exists only because the dispatcher runs on ephemeral GitHub-hosted runners. #259 moves the dispatcher to persistent infrastructure, where local disk supersedes the cache steps.
+
+---
+
+## Executable Issue Types in the Invoke Loop
+
+Only Stories, Tasks, and Bugs are executable units for `/implement`. Before executor-label routing, `scripts/dispatcher-invoke.sh` classifies every story the [scheduler](#scheduler-new-work-from-github-facts) chose for `/implement`, or `--issue` named (issue #256):
+
+| Type metadata | Result |
+|---|---|
+| Exactly one `type:story`, `type:task`, or `type:bug` label | Executable |
+| No `type:` label, native GitHub issue type `Story`, `Task`, or `Bug` | Executable (the native type is only a fallback) |
+| `type:epic`, `type:feature`, any other `type:` label, more than one `type:` label, another native type, or no type at all | Non-executable |
+
+Type is never inferred from the title or from an `executor:` label. A non-executable candidate is not treated as fatal. The dispatcher:
+
+- writes one warning to stderr naming the issue and its detected, missing, or unsupported type
+- excludes the item from reselection for the rest of the run
+- continues to the next ready item:
+
+```
+Warning: #<N> is not an executable Story, Task, or Bug (detected type: type:epic); skipping it for this run and continuing selection.
+```
+
+If no executable item remains, the run exits `0` and invokes no executor. `--dry-run` makes the same skip decisions without any executor invocation or GitHub mutation.
+
+This skip applies only to the item's type. A Story, Task, or Bug with a missing or unrecognised `executor:` label is still a fatal configuration error (non-zero exit), and the error lists the supported labels:
+
+```
+       Add one of: executor:claude-code-haiku, executor:claude-code-opus, executor:claude-code-sonnet, executor:codex
+```
+
+The invoke step applies the type guard to the story the scheduler chose.
+
+---
+
+## Usage Limit Check in the Invoke Loop
+
+Every session start goes through `invoke_executor_command()`. It calls `check_usage_limit` first (see [Usage limit](#usage-limit)), then `check_subscription_allowance`, and counts the session with `record_session_start` just before it starts. A fix round is an `/implement` session and counts like any other.
+
+Under `--dry-run` the check is logged and nothing is counted or sent:
+
+```
+[DRY RUN] Would check usage limit before /<step>
+```
+
+---
+
+## Codex review loop hand-off and resume
+
+A Claude-implemented story is reviewed by Codex Cloud, not by a dispatcher session (ADR-006, issue #293). Codex answers asynchronously, so the dispatcher ends the story's run after `/implement` and picks the story up again on a later run. Everything is decided from GitHub facts read at the start of that run: the linked PR, its merge gates and hidden markers in comments. No board status chooses a step: moving a card starts nothing (issue #475, ADR-010). Nothing is remembered on the runner. The dispatcher honours its own markers only on comments written by its own account (the login behind `GH_TOKEN`), and the bookkeeping job's marker only on comments by that job's account, so a marker pasted into a comment by anyone else has no effect. Both rules live in `hpw dispatcher marker` (see [Markers](#markers--hpw-dispatcher-marker)).
+
+The `codex-review-bookkeeping` workflow does the part in between. It acts only on a story in `In review` or `Blocked`, and posts the review Session Summary with its marker: `Next: merge` after a clean review with green required checks and a passed approval gate, `Next: implementation` after findings. It writes no board status (issue #478). `/implement` posts the review request; the dispatcher posts none.
+
+### Work in flight from PR facts
+
+The resume pass of `scripts/dispatcher-invoke.sh` and `scripts/dispatcher-poll.sh` find every step from the facts below, whatever the story's board status (issue #475). One rule decides for both: `hpw dispatcher in-flight plan` (`src/headless_pr_workflow/dispatcher/in_flight.py`), on the facts `scripts/lib/in-flight.sh` reads. The *linked PR* of an open Story, Task or Bug is the first open PR whose body says `Closes #<n>`, `Fixes #<n>` or `Resolves #<n>`. A story counts as a *review-loop story* when it has exactly one `executor:` label and that label has a `CODEX_REVIEW_LOOP_ROUTING` row.
+
+| Step | Fact that selects the story |
+|---|---|
+| [Merge](#the-merge-step) | an open, non-draft linked PR whose merge gates all pass on its current head, ignoring the mergeability gate: `policy`, `checks`, `approval`, `threads` and `head` pass, as `scripts/merge-gate-summary` evaluates them |
+| [Finish](#the-merge-step) | no open linked PR, and a merged linked PR among the 100 most recently updated closed PRs |
+| [Fix round](#fix-round) | a review-loop story with an open linked PR whose current head has the bookkeeping job's findings marker |
+| [Pending hand-off](#hand-off-after-implement) | a review-loop story with an open, non-draft linked PR and the dispatcher's own `hand-off-pending` marker for it, with no `hand-off-done` marker |
+| [Review](#review-of-a-codex-implemented-pr) | a story with an open, non-draft linked PR that is not in the merge step: `/review` once per head for a story with a `REVIEW_EXECUTOR_ROUTING` row; the [conflict-round](#conflict-round) and missing-owner rules for a review-loop story |
+
+A merge gate that cannot be read counts as not passing, so the story stays in the review step until the next run. A comment list that cannot be read finds no fix round, hand-off or blocker for that story in this run, and a warning says so. Without the dispatcher's account (`hpw dispatcher marker whoami` fails) no fix round or pending hand-off is found in that run. When the open issues or the open PRs cannot be read, no in-flight session starts in that run.
+
+**Moving a card starts nothing.** A story with no linked PR and no dispatcher marker gets no session, whatever its card says, and it is in no poll key. The dispatcher writes no board status (issue #478); the board writer corrects a moved card on its next run. The dispatcher reads no board status to decide anything: the WIP pre-flight also counts from PR facts.
+
+**The two scheduler lists.** Every `hpw dispatcher scheduler next` call, from the poll and from `ask_scheduler` in the invoke step (both through `scheduler_next` in `scripts/lib/scheduler.sh`), gets two lists built from the same facts:
+
+- `--in-implementation`: the stories with an open linked PR that is a draft, or whose current head has a fix round due. They count against `WIP_LIMIT_IMPLEMENTATION` and for the file overlap.
+- `--in-flight`: every other open Story, Task or Bug with an open linked PR, and every one with an open Blocked Declaration of type `dependency`, `external`, `conflict` or `resource` that no later PO `/unblock` line resolves. The scheduler never starts them and refines them only when stale, and does not count them for the WIP limit or the file overlap.
+
+**Stale spec record (F2.7).** Before a fix round, conflict round, `/review` or `/merge`, the invoke step reads the facts of `hpw dispatcher facts read` (#283), once per run. When a story's facts say `stale`, that session does not start, and the run log carries `[RESUME SKIP] #<n>: stale spec record (<record commit> is older than the Epic's <current commit>); no fix round, conflict round, /review or /merge until it is re-refined`. The story stays in the scheduler's lists, so it is not started as new work, and the scheduler chooses its re-refinement (step 2). Finishing a PR that is already merged (`Done` and `/cleanup`) is not held back: no implementation session runs. The check fails closed: when the facts cannot be read, no fix round, conflict round, `/review` or `/merge` starts in that run, and the log carries `[RESUME SKIP] facts unreadable: <error>; no in-flight session in this run`. When only one story's facts are unreadable, only that story is skipped: `[RESUME SKIP] #<n>: facts unreadable (<reason>); trying again on the next run`. A story with no parent Epic, or under an Epic with no merged spec, is never stale and continues as before.
+
+**Retired.** The `in-merge-without-pr` blocker is no longer posted: no board status is a trigger, so there is no contradiction to report.
+
+### Hand-off after `/implement`
+
+For a story whose executor has a `CODEX_REVIEW_LOOP_ROUTING` row, after `/implement` succeeds the dispatcher:
+
+- finds the linked open PR. With no linked open PR, or a PR that is still a draft, it posts the mid-cycle blocker for `/implement` and exits `1`;
+- with no linked open PR, first asks `hpw dispatcher session-blocker read --issue <n>` (issue #533) whether the story has an open Blocked Declaration that the dispatcher did not post: a trusted comment with a `Type:` line and a `Declared by:` line other than `dispatcher` or `codex-review-bookkeeping`, with no PO `/unblock` line and no trusted `Unblocked` comment after it, whenever it was posted. When it has one, the session's declaration is the record: the dispatcher posts no blocker, registers no `po_blocker` event (a decision blocker is notified once, by the decision-blocker check after `/implement`), does not fail the run, logs `[HANDOFF] #<n>: /implement ended without a PR; open Blocked Declaration (Type: <type>) from <declared by>: <url>; no dispatcher blocker` and goes on to the next ready story. When it has none, or the comments cannot be read, it logs `Error: No linked open PR found for #<n> after /implement.`, posts the blocker and exits `1` as before. The rule is `src/headless_pr_workflow/dispatcher/session_blocker.py`;
+- when that draft PR conflicts with main (`mergeable == false` or `mergeable_state == "dirty"`, read from `gh api repos/<repo>/pulls/<n>`), posts a blocker that names the merge conflict with main, says no CI run can start and gives "the PR branch is merged with main and the conflict resolved" as the unblock condition; it still exits `1`. A clean PR, an unknown mergeability (`null`) and a failed read keep the generic blocker. GitHub starts no `pull_request` workflow for a conflicting PR, so the required `pytest` check stays absent; this, not the push token, stalled PR #371. `/implement` merges `origin/main` into the branch before its final push and reports `merge conflict with main` when it cannot resolve the conflict (issue #381);
+- writes no board status (issue #478). The non-draft PR is the fact: the board writer step shows it as `In review` in the same run, and the PR keeps the story out of new work;
+- writes nothing when Codex answered with findings while the session was still running: a fix round is due on the new head, and the next run starts it;
+- posts no new pending hand-off marker. A `hand-off-pending` marker left by a run before issue #478 is completed by a later run without starting `/implement` again (`[RESUME] #<n>: completing the hand-off on PR #<pr>`): it posts the `hand-off-done` marker, so the hand-off is completed once;
+- starts no `/review` session;
+- logs `[HANDOFF] #<n>: handed to the Codex review loop (Codex Cloud) on PR #<pr>; no /review session started` and goes on to the next ready story.
+
+### The merge step
+
+A story is in the merge step when its open, non-draft linked PR passes every merge gate except mergeability on its current head, whatever its executor and its board status ([Work in flight from PR facts](#work-in-flight-from-pr-facts)). It is taken up at `/merge`. `/merge` and `/cleanup` here are the script-only phases (issue #264): no session starts and no allowance is checked. The merge gates inside `scripts/dispatcher-merge.sh` still decide whether the PR merges.
+
+| Facts | What the dispatcher does |
+|---|---|
+| A linked open PR that is not a draft, and GitHub reports it clean | `/merge`, then `/cleanup`, then the feature and epic closure check. Log: `[RESUME] #<n>: /merge PR #<pr>` |
+| That PR conflicts with main, and the story is a review-loop story (one `executor:` label with a `CODEX_REVIEW_LOOP_ROUTING` row) | No `/merge` and no merge-attempt marker. When the [conflict-round rule](#conflict-round) owes a round, it starts after every `/merge` of the run. Log: `[RESUME] #<n>: PR #<pr> conflicts with main; the conflict round starts after this run's merges` |
+| That PR conflicts with main, and the story has no review-loop row (for example `executor:codex`) | No `/merge` and no session. One `Type: external` blocker that names the merge conflict with main and the PR, once per PR head, sent as a `po_blocker`. Unblocked when: the PR branch is merged with main and the conflict resolved, or the PO posts `/unblock`. |
+| GitHub has not computed the PR's mergeability yet (`mergeable == null`) | Nothing in this run: no `/merge`, no conflict round, no marker, no blocker. Log: `[RESUME SKIP] #<n>: GitHub has not computed mergeability for PR #<pr> yet; trying again on the next run` |
+| No open PR, and a merged PR that closes the story (the finish step) | `/cleanup`, no `/merge`. This finishes a run that stopped between merge and cleanup. |
+
+A story with neither, including one with a PR that is still a draft, is not in the merge step: no blocker is posted (the `in-merge-without-pr` blocker is retired, issue #475).
+
+"Conflicts with main" is the test of the hand-off above: `mergeable == false` or `mergeable_state == "dirty"` from `gh api repos/<repo>/pulls/<n>` (issue #409). When that read fails, `/merge` runs as before and its merge gate decides.
+
+**Evidence that could not be written (issue #348).** The `merge-owner` marker, the merge confirmation and the cleanup closing Session Summary are durable evidence. When a write of one fails (after 3 attempts), the writer leaves one *evidence-pending* comment with the exact text as a hidden base64 payload (`scripts/lib/evidence-pending.sh` format; the merge confirmation and the closing summary through `hpw dispatcher write comment --evidence-item`; nothing is kept on the runner). The dispatcher posts that text once on a later run. Only comments of the dispatcher's own account count, for the pending comment and for the proof that the text is already posted; a copy written by anyone else proves nothing.
+
+| Item | Pending comment on | Posted by a later run |
+|---|---|---|
+| `merge-owner` | the PR, for the head the `/implement` session produced | before `/merge`, and only while the PR is still at that head; a pending marker for another head is never posted (`[RESUME SKIP] ... is for head <sha>, not <sha>`) |
+| `merge-confirmation` | the PR, for the merged head | before `/cleanup`; the story stays in the merge step until it is posted. A merge script that merged and then failed only on this comment is not a merge blocker |
+| `cleanup-summary` | the story, whose PR is merged | by the resume pass, through the `evidence:pending` label (see below) |
+
+A retry posts nothing when the exact text is already on the issue or PR (no duplicate), and `/merge` is still not run twice for one head. Each failed run adds a `evidence-retry-failed` marker comment on the story. After 3 failed runs for the same item the dispatcher posts one `Type: external` blocker on the story, which sends one retried Slack `po_blocker` (no `dispatcher_error`), and stops (`[RESUME SKIP] ... retrying stopped after 3 runs, waiting for a PO /unblock line`). Other stories are not held back. A standalone `/unblock` from the PO, after the evidence is posted by hand or the cause is fixed, starts the count again. Log lines: `[RESUME] #<n>: posting the missing <item> evidence on #<target>`, `[RESUME SKIP] #<n>: the <item> evidence ...`.
+
+**The `evidence:pending` label.** No fact leads back to a closed story, so when `/cleanup` leaves the closing summary as a pending comment the dispatcher also adds the label `evidence:pending` to the story. Each resume pass lists the issues with that label (one call, whatever their age), posts each pending summary once, and removes the label once the summary is on the story or nothing of the dispatcher's own is pending. While retrying has stopped after the 3-run limit, the label stays until the PO's `/unblock` lets the next run post the summary. The label is only an index: anyone can add or remove it, but what is posted is still read from the dispatcher's own pending comment, so a label added by someone else only causes a read. The workflow's poll step also lists the label (one call per cycle) and counts a labelled story as resumable work, so `dispatcher-invoke.sh --resume` runs even when nothing is ready, in the merge step or in implementation; a failed read of the label counts as pending. The dispatcher creates the label in the repository before it first adds it, because GitHub refuses to add a label the repository does not have; you can also create it by hand. A failed label write counts as no pending copy (gap (2) below).
+
+**The story cannot be written (issue #372).** #348 counts failed runs with marker comments on the story, so it counts nothing when the story's comments cannot be written. When a run cannot write the `evidence-retry-failed` marker or the give-up blocker on the story, the dispatcher measures how long the item has been missing from a GitHub timestamp: the `created_at` of its own evidence-pending comment, or else the linked PR's `merged_at` (`merge-confirmation-missing`, `cleanup-summary-unrecorded`). At 15 minutes or more (`EVIDENCE_UNWRITABLE_MINUTES`, default 15) it queues one `evidence_unwritable` event in the notification state, keyed by story, timestamp, item and ref, so a later run queues no second one and a different item is a separate event. It logs `[RESUME SKIP] #<n>: the <item> evidence on #<target> has been missing for <minutes> min and the story cannot be written; PO alert queued`. The Slack message names the story, the item, the PR or issue it belongs on, the minutes, and what the PO can do: fix the cause of the failed write or, when a pending comment exists, post its text by hand. The event is retried like the other actionable events and stops when the evidence is posted or the give-up blocker is on the story. Only comments of the dispatcher's own account count. The state decides only whether to send the alert; merge and cleanup decisions still use GitHub facts. If the state is lost, one extra alert is possible. Nothing is queued or sent under `--dry-run`.
+
+Two gaps have no pending comment to retry, so they are closed separately. (1) A merged PR with no `Merge gate:` confirmation from the dispatcher, for example when the merge script failed before it wrote one, does not reach cleanup: each run counts a `merge-confirmation-missing` failure and, after 3, posts the blocker and the Slack message; a PO `/unblock` after that accepts the gap and cleanup follows. (2) When `/cleanup` fails and neither its closing summary nor a pending copy with the `evidence:pending` label is on the story (the pending or the label write failed too), the finish step of a later run reruns cleanup while the story is open with its merged PR, with the same 3-run limit (`cleanup-summary-unrecorded`); after the limit the story keeps the blocker. No board status is written for it (issue #478).
+
+**One merge attempt per head.** When `/merge` fails, the mid-cycle blocker records the PR head it was tried on, and the story stays in the merge step. Later runs do not run the merge script for it and log `[RESUME SKIP] #<n>: /merge was already tried on PR #<pr> at head <sha>`. Another attempt needs a new PR head, or a standalone `/unblock` line from the PO posted after the blocker (the resolving-comment rule of issue #262). The same applies when `/merge` fails in the same run as `/review` for an `executor:codex` story.
+
+**Decision-document PRs (issue #502).** `scripts/dispatcher-merge.sh` exits `3` (not `1`) when the PR changes decision documents (ADR-011); its stderr names the PR and the files. The dispatcher then posts the same `Type: external` blocker with the `merge-attempt` marker, but with `Cause: PR #<n> changes decision documents (ADR-011): <files>. The PO reviews and merges it personally in GitHub. This is a planned step, not a failure.` (the first 5 files, then `and <k> more`), `Unblocked when: The PO has reviewed and merged PR #<n> in GitHub, then replies with a line that is exactly /unblock.` and `State of in-progress work: waiting for the PO to review and merge PR #<n>; the story stays in the merge step`. It is sent as the usual `po_blocker` event with the same Cause, Unblocked when and State text. Every other `/merge` failure keeps the generic text.
+
+### Review of a Codex-implemented PR
+
+`executor:codex` stories are not started for `/implement` by the dispatcher; the [local Codex worker](#local-codex-worker) on the PO's computer starts them. When the scheduler chooses one, it is skipped with `Warning: #<n> has executor:codex, which the dispatcher does not start for /implement (no subscription mechanism, ADR-012); skipping it for this run and continuing selection.` The skip changes and spends nothing (no board write, comment, blocker, notification, counted session or allowance probe), and the story is not returned again in the same run. It is a lookup, not a branch on the label: an executor with no `EXECUTOR_PROVIDER` row is not started for `/implement`.
+
+A PR that Codex implemented outside the dispatcher is still reviewed by it. The resume pass has a fourth entry, the review step. A review is due when all of these hold, whatever the story's board status (issue #475):
+
+- it has a linked open PR that is not a draft and is not in the [merge step](#the-merge-step);
+- it has exactly one `executor:` label, and that label has a `REVIEW_EXECUTOR_ROUTING` row (`scripts/lib/review-routing.sh`, shared with `scripts/dispatcher-poll.sh`).
+
+The dispatcher then runs `/review <pr>` through `invoke_executor_command()` under the executor the table names (`claude-code-opus`). The usage limit and the allowance reserve apply as for any session. Log: `[RESUME] #<n>: /review on PR #<pr> under claude-code-opus`. A story that waits for Codex Cloud (a `CODEX_REVIEW_LOOP_ROUTING` row) logs nothing; a story with zero or two `executor:` labels logs one `[RESUME SKIP] #<n>: <reason>` line. A story with no linked open PR or a draft PR is not in the review step.
+
+After `/review` succeeds the PR's merge gates are read again; the board status decides nothing. When the gates put the PR in the merge step, the script-only `/merge` and `/cleanup` and the closure check run as for any story in the merge step. Otherwise the entry ends with `[RESUME] #<n>: /review left PR #<pr> outside the merge step; no merge`: when `/review` found blockers the fixes are made outside the dispatcher, as the implementation was.
+
+**One `/review` attempt per head.** When `/review` fails, the mid-cycle blocker records the PR head it was tried on. Later runs log `[RESUME SKIP] #<n>: /review was already tried on PR #<pr> head <sha7>; waiting for a new head or /unblock` and start no session. A new PR head, or the PO's `/unblock`, allows one new attempt.
+
+`scripts/dispatcher-poll.sh` lists such stories as `review_due` (number and title), and the workflow counts `review_due` in `resumable`, so the invoke step runs for them even when nothing else is due. A run whose only story in the review step is Claude-tier gives `review_due: []`. Under `--dry-run` the entry logs `[DRY RUN] Would start Claude Code (opus) on the subscription for /review <pr>` and starts nothing.
+
+### Fix round
+
+A fix round is due when all of these hold, whatever the story's board status (issue #475):
+
+- it has exactly one `executor:` label, and that label has a `CODEX_REVIEW_LOOP_ROUTING` row;
+- it has a linked open PR;
+- the PR has a comment by the bookkeeping job's account that carries the job's hidden marker with `action=move-in-implementation` and `head=` equal to the PR's current head.
+
+The dispatcher then runs `/implement` for the story, which continues on the existing PR, and applies the hand-off again. Log: `[RESUME] #<n>: fix round <k> of <max>, /implement on PR #<pr>`.
+
+- A fix round is picked up on the next run. It does not wait for the stale threshold.
+- The story already holds its place within the WIP limit, so the WIP and file-overlap checks are not run against it again. This holds on both sides: the dispatcher does not run its pre-flight for a fix round, and `.claude/commands/implement.md` step 7 tells the session to skip its own WIP pre-flight for a story that is already `In implementation` with an open PR. The allowance check before the session still applies. When it refuses, nothing is written and the log line is `[RESERVE SKIP] #<n>: fix round not started; …`.
+- Once the session pushes a commit, the marker no longer names the PR's head, so the same findings start no second round.
+- The dispatcher reads only the bookkeeping job's marker. It does not parse Codex comments or reviews.
+- The bookkeeping job's account is the login behind the dispatcher's own token, because both workflows use `PROJECT_TOKEN`. Set `CODEX_BOOKKEEPING_LOGIN` in the environment if the two ever differ. A marker in a comment by any other account is ignored.
+
+**Maximum fix rounds.** The dispatcher counts the PR heads for which the bookkeeping job recorded findings, one per head. When the count is above `CODEX_FIX_ROUND_MAX`, it starts no session, logs `[RESUME SKIP] #<n>: fix round <k> on PR #<pr> is above the maximum of <max>` and posts one `Type: resource` blocker on the story, once; the blocker is also sent to Slack as a `po_blocker` event (type, `Unblocked when`, state of the work, a link and the `/unblock` resume line), retried like `decision_blocker`. A round with only Out of scope findings pushes no new head, so it starts no further round; the story waits for the PO's waiver.
+
+| Variable | Valid values | Default |
+|---|---|---|
+| `CODEX_FIX_ROUND_MAX` | whole number of `1` or more | `3` |
+
+Set it as a repository variable; `.github/workflows/dispatcher.yml` passes it to the invoke step. An unset or empty variable uses the default. Any other value stops the run with an error before any session starts.
+
+**One fix-round attempt per head.** A fix round that fails, or an `/implement` session that ends on the same PR head it started on while the findings for that head are still open, is not repeated on the same head, whatever status the session left the story in. The mid-cycle blocker for `/implement` records the head, and later runs log `[RESUME SKIP] #<n>: the fix round was already tried on PR #<pr> at head <sha>` until the PR has a new head or the PO posts a standalone `/unblock` line.
+
+### Conflict round
+
+When the dispatcher merges one story, another dispatcher PR can start to conflict with `main` (issue #409). For a review-loop story (exactly one `executor:` label with a `CODEX_REVIEW_LOOP_ROUTING` row) the dispatcher then resolves the conflict itself, in a *conflict round*: one `/implement` session under the story's own executor that merges `origin/main` into the PR branch, resolves the conflict, runs the focused tests and pushes (`.claude/commands/implement.md` step 10).
+
+**The rule (issue #449).** A stopped conflict round is never resumed. The dispatcher keeps no record of an open round. Every run decides from GitHub facts only, with one rule that `scripts/dispatcher-poll.sh` and the resume pass of `scripts/dispatcher-invoke.sh` share (`conflict_round_rule` in `scripts/lib/conflict-round.sh`). A conflict round is owed when all of these hold, and only then:
+
+- the story is a review-loop story, whatever its board status;
+- its linked open, non-draft PR conflicts with main (`mergeable == false` or `mergeable_state == "dirty"`);
+- no fix round is due: no bookkeeping `move-in-implementation` marker for the current head without a fix-round attempt marker that holds for it. A completed fix round on the head (its findings and its attempt marker) does not hide an owed round;
+- the story has no open blocker: a `## Blocked Declaration` with no later standalone `/unblock` line from the PO. A dispatcher blocker whose hidden marker names an older PR head is not open;
+- no conflict-round attempt marker holds for the current head.
+
+The poll lists such stories in the review step under `conflict_due`; a story with a fix round due is already listed under `in_implementation`, and one in the merge step under `in_merge`. The next run starts one fresh round.
+
+What the round does:
+
+- It runs no WIP or file-overlap check: the story already holds its place.
+- No board status is written before or after the session (issue #478). A refused start changes nothing, and the next run applies the rule again. Log: `[RESUME] #<n>: PR #<pr> conflicts with main; conflict round, /implement on PR #<pr>`.
+- The session keeps the PR Ready for review for the whole round (implement.md step 10), also when its `pytest` check fails or is still pending at the end, so a round that stops leaves a PR the rule can read.
+- Success is judged from the PR, not from a new head. After a session that exits `0`, the dispatcher reads the PR again. When it no longer conflicts and the newest run of the required `pytest` check on the current head completed with success, the dispatcher posts the merge-owner marker for the current head (or its evidence-pending copy) and applies the [hand-off](#hand-off-after-implement), and the session requests the Codex review. The head reaches the merge step only after a clean review on that head, green required checks and a passed approval gate, and a later run merges it with the unchanged script-only `/merge` and `/cleanup`. No PO action is needed.
+- No PO alert is sent while the dispatcher resolves the conflict.
+
+**One conflict round per head.** When the session fails, the PR still conflicts after it (the session reports `merge conflict with main on PR #<n>`), or the `pytest` check on the head is not green (failed, still running, absent or unreadable), the dispatcher posts one `Type: external` blocker on the story and exits `1`. The blocker names the merge conflict with main and the PR, says it is the PO's only alert for this conflict, and gives "the PR branch is merged with main and the conflict resolved, or the PO posts /unblock" as the unblock condition. It carries a hidden attempt marker for the PR's current head and is sent once as a `po_blocker`. Later runs start no second round on that head and log `[RESUME SKIP] #<n>: the conflict round was already tried on PR #<pr> at head <sha7>; waiting for a new head or a PO /unblock line`. A new head, or a standalone `/unblock` line from the PO, allows one new attempt.
+
+**A stopped round.** A usage-limit pause posts only the standard [pause record](#pause-at-a-provider-usage-limit), with step `conflict round`, for the PO's information; the dispatcher never reads it. A cancelled run or a failed write of the pause record leaves nothing at all. In each case the next run applies the rule to the PR as it is then. While the PR still conflicts, a fresh round starts. When the session pushed before it stopped and the PR is clean, its head has no merge-owner evidence, and the story gets the blocker below. Only pushed commits survive.
+
+**A head left without an owner.** A review-loop story is in the review step: its linked open non-draft PR is not conflicting, no fix round is due, no hand-off is pending, and the current head has no merge-owner evidence: a session stopped after its push, before the hand-off finished. The dispatcher starts no session. It posts one `Type: resource` blocker, once per head, sent as one `po_blocker`. The blocker says that the merge owner is missing for head `<sha7>` on PR #<pr>, that a session stopped after its push before the hand-off finished, and that the PO can follow [`docs/TAKEOVER-RULES.md` → Merge Takeover](TAKEOVER-RULES.md) or post `/unblock` after pushing a new head. Log: `[RESUME SKIP] #<n>: PR #<pr> head <sha7> has no merge-owner evidence; blocker posted`. A later run on the same head posts nothing more. The poll reports such a story under `owner_missing_due` until the blocker is posted, so the workflow runs the invoke step even when nothing else is due. The blocker applies to every review-loop story, so a fix round or a first `/implement` stopped after its push gets it too. **In the merge step (issue #406).** The same rule holds for every story in the merge step, whatever its executor: when the linked open non-draft PR is not conflicting and its head still has no dispatcher merge-owner marker after the pending copy was posted (`ensure_merge_owner`), the dispatcher does not run `/merge`. It posts one `Type: resource` blocker per head with the `merge-owner-missing` marker, sent as one `po_blocker` (no `merge-attempt` marker, no `dispatcher_error`). The blocker says that the head was not pushed by a dispatcher session (for example a manual fix round), so the dispatcher does not merge it, and that the PO merges PR #<pr> by hand with `/merge <pr>` and then runs `/cleanup <pr>` ([`docs/TAKEOVER-RULES.md` → Merge Takeover](TAKEOVER-RULES.md)). Later runs on the same head, also after `/unblock`, log `...; the blocker is already posted` and post nothing. A head with the marker or a pending copy for exactly that head still goes to the merge script. A manual fix round after `fix-round-max` ends the same way: the head it pushes is merged by the PO by hand. If the story stays open after a manual merge, the merged-PR path asks for the dispatcher's own merge confirmation (issue #348 give-up blocker applies).
+
+**Not a fix round.** Conflict rounds do not count toward `CODEX_FIX_ROUND_MAX`: only the bookkeeping job's findings markers count. A story without a review-loop row gets no conflict round; see the [merge step](#the-merge-step) table.
+
+### Order and entry into a run
+
+Each run handles resumable work before it starts new work:
+
+1. stories in the merge step, then the stories to finish (a merged linked PR). The board is read again after each one that finishes, for the feature and epic closure check. A conflicting PR of a review-loop story is only queued here;
+2. fix rounds that are due, and hand-offs that are still pending;
+3. stories in the review step (a `/review` session for a Codex-implemented PR; a conflicting review-loop PR is queued);
+4. the queued conflict rounds. Every `/merge` of the run has run by then, so each round starts from the newest `main`;
+5. then one [scheduler](#scheduler-new-work-from-github-facts) decision for new work, asked right then.
+
+`scripts/dispatcher-poll.sh` reports the candidates in more keys of its JSON, `in_merge`, `in_implementation`, `review_due`, `conflict_due` and `owner_missing_due` (each `[{number, title}]`). Each key is built from the [PR facts](#work-in-flight-from-pr-facts), whatever the board status (issue #475): `in_merge` lists the merge and finish steps, `in_implementation` the fix rounds due and the pending hand-offs, `review_due` the review step for a story with a `REVIEW_EXECUTOR_ROUTING` row. `conflict_due` lists the review-loop stories in the review step that the [conflict-round rule](#conflict-round) owes a round. `owner_missing_due` lists, by the same rule, the review-loop stories in the review step whose clean head has no merge-owner evidence and no missing-merge-owner blocker yet ([A head left without an owner](#conflict-round)). Together they cost one PR read per review-loop story in the review step per poll, and two comment reads when GitHub has computed that PR's mergeability. A story whose PR or comments cannot be read is not listed, and the poll writes `[POLL] Warning: could not read PR #<pr> for #<n>; conflict_due and owner_missing_due skip it this cycle` or `[POLL] Warning: could not read the comments of #<n> or PR #<pr>; conflict_due and owner_missing_due skip it this cycle`. The poll also reports the scheduler's choice (`next_issue`, `next_action`, `scheduler_result`). `.github/workflows/dispatcher.yml` starts the invoke step, and the steps that prepare a session before it, when the scheduler chose new work (`next_issue` is set) **or** any of these lists is non-empty:
+
+**Admission rules** (issue #557). Whether a story may start has one implementation each, in `src/headless_pr_workflow/dispatcher/admission.py` (limits in `scheduler.load_limits`): the executable type (`classify_executable_type`; conflicting `type:` labels are not executable), the `executor:` labels (`executor_labels`; the first routes, a review-loop story needs exactly one), the WIP limit and the file overlap (`wip_reached`, `overlapping_paths`). The scheduler and the new-work pre-flight of `scripts/dispatcher-invoke.sh` (Steps 1b, 2, 5 and 6) call the same functions, through `hpw dispatcher admission limits|type|executor|start`; an answer that cannot be read stops the start (fail closed). `tests/test_dispatcher_admission.py` sends the same facts through both entries.
+
+```
+bash scripts/dispatcher-invoke.sh --repo <owner/repo>               # resumable work first, then the scheduler's new work
+bash scripts/dispatcher-invoke.sh --repo <owner/repo> --issue <n>   # resumable work first, then story <n> (manual)
+bash scripts/dispatcher-invoke.sh --repo <owner/repo> --resume      # resumable work only (manual)
+```
+
+The workflow always uses the first form (or `--refine <n>` for the `refine_issue` input); `--issue` and `--resume` stay for manual runs. It runs the invoke step when the scheduler chose new work, when `in_merge` or `in_implementation` is non-empty, when `review_due`, `conflict_due` or `owner_missing_due` is non-empty, or when an issue carries the `evidence:pending` label (issue #348). A run in which nothing is due starts no session and exits `0`.
+
+The invoke step needs no Status option: it writes no board status, and the board writer reports a missing option per item (issue #478).
+
+### Exit codes and `--dry-run`
+
+| Exit | Meaning |
+|---|---|
+| `0` | The story was handed to the review loop, a resume entry completed, a story was skipped by a bound, or there was nothing to do. |
+| `1` | A session failed and a blocker was posted. |
+| non-zero, no blocker | An invalid `CODEX_FIX_ROUND_MAX`. |
+
+Under `--dry-run` each of the lines above is logged with a `[DRY RUN]` prefix, the hand-off is logged as `[DRY RUN] Would hand #<n> to the Codex review loop …`, and no session starts and nothing on GitHub changes.
+
+### Known limits
+
+- A session that ends without an error counts as a success. After `/merge` the dispatcher runs `/cleanup` without reading the PR's merged state itself; `scripts/dispatcher-merge.sh` exits 0 only after `hpw merge-pr` confirmed the merge (or GitHub already reported it merged).
+- The bookkeeping job resolves Codex's own finding threads from older heads when Codex returns a clean result on the current head, and posts no Session Summary while an unresolved thread it may not resolve remains (a human's thread, a Codex thread on the current head, or one whose review commit cannot be read): it posts a `Type: external` blocker instead. A thread the PO or another reviewer opened is still resolved by a person, and a defect named in an auto-resolved thread that Codex did not re-check can reach `main` (accepted risk, ADR-006 revisit rule). See [HEADLESS-PR-WORKFLOW.md → Codex review loop](HEADLESS-PR-WORKFLOW.md#codex-review-loop).
+- A session that stops after its push, before the hand-off finished, is not continued, except a fix round stopped by a provider usage limit (issues #446, #447): the pause finishes it in the same run by recording the merge owner for the pushed head and handing it off. In the remaining cases the story gets one `Type: resource` blocker for a head without merge-owner evidence ([conflict round](#conflict-round) → A head left without an owner), and the PO finishes it by a merge takeover or a new head. This applies to every review-loop story in the review step, including one whose PR was implemented outside the dispatcher; a story in the merge step gets the same blocker with the manual-merge way out (see above).
+- A story paused at a provider usage limit waits at its step (fix round, `/review`, new `/implement`) until the usage limit and the allowance check allow a start; the run ends at that refused start. Only pushed commits survive a pause.
+- The merged-PR lookup of the finish step reads the 100 most recently updated closed PRs, and the work in flight reads open issues only: GitHub closes the story when its PR merges, so a closed story whose cleanup failed comes back only through the `evidence:pending` label (issue #348).
+- The merge gates cost one `scripts/merge-gate-summary` evaluation per open non-draft linked PR, in each poll and each time the invoke step reads the work in flight.
+- The `codex-review-bookkeeping` job still reads its entry guard from the board: it acts only on a story in `In review` or `Blocked` (issue #478; `Blocked` because the writer shows the job's own blockers that way). The board writer sets that status from the non-draft PR on each dispatcher run, so the job can see a status up to one run old; a card moved out of `In review` by hand is corrected on the next run. The dispatcher itself does not depend on the column.
+
+---
+
+## Subscription allowance and reserve
+
+Before every model session start (`/implement` and `/review`), the dispatcher runs `scripts/dispatcher-allowance.sh` (issue #317, ADR-012). The script reads how much of the PO's five-hour and weekly Claude subscription allowance is left. A session starts only when **both** windows are at or above the reserve the PO has set. When the allowance cannot be read, nothing starts.
+
+### Reserve variables
+
+Set these as repository variables under **Settings → Secrets and variables → Actions → Variables**:
+
+`https://github.com/<owner>/<repo>/settings/variables/actions`
+
+| Variable | Valid values | Default |
+|---|---|---|
+| `RESERVE_FIVE_HOUR_PERCENT` | whole number `0`–`100` | `10` |
+| `RESERVE_WEEKLY_PERCENT` | whole number `0`–`100` | `20` |
+
+- The reserve is the share of each window, in percent, that autonomous work must leave untouched. Remaining share = (1 − `utilization`) × 100. A start needs remaining ≥ reserve in both windows; equality is a start.
+- An unset or empty variable uses the default. GitHub passes an unset `vars.X` as an empty string.
+- Any other value (`abc`, `-1`, `101`, `10%`, `7.5`) is an `[ALLOWANCE ERROR]` that names the variable and the value. No probe runs.
+- A change applies on the next poll that finds work. No code change is needed. A hold written under the old values is ignored.
+
+### Subscription token — `CLAUDE_CODE_OAUTH_TOKEN`
+
+The probe signs in with the repository secret `CLAUDE_CODE_OAUTH_TOKEN`, an OAuth token for the PO's subscription created with `claude setup-token`.
+
+- Save the secret with nothing before or after the token. The scripts remove every whitespace character before use, but a token with stray characters inside it is rejected with `401 OAuth access token is invalid`, which does not name the cause.
+- The current token was created on 2026-10-08 and lasts one year. Renew it before 2027-10-08 by running `claude setup-token` again and replacing the secret.
+- The script and the dispatcher log only the token's presence and its length after whitespace removal, never its value.
+
+### The probe
+
+One Claude Code turn on Haiku, with no tools, a fixed short prompt, and the repository's instructions left out (it runs from an empty temporary directory):
+
+```
+claude -p "Reply with the single word OK." --model haiku --tools "" --strict-mcp-config \
+  --no-session-persistence --output-format stream-json --verbose
+```
+
+- `--bare` is never used: bare mode ignores the OAuth token (ADR-012 → Candidate B).
+- Every variable whose name starts with `ANTHROPIC_` is removed from the probe's environment by `scripts/lib/claude-session.sh`, the helper the sessions use too (issue #314). If the init message does not report `apiKeySource: "none"`, the result is an error, so the probe can never bill a metered key.
+- The probe times out after 120 seconds (override with `ALLOWANCE_PROBE_TIMEOUT`).
+- The script reads `rate_limit_info.unifiedWindows.five_hour` and `.seven_day` (`utilization`, `resetsAt`) and `rate_limit_info.overageStatus` from the `rate_limit_event` line. Anthropic does not document `unifiedWindows`.
+
+### Pinned Claude Code version
+
+`.github/workflows/dispatcher.yml` installs Claude Code in the "Install Claude Code" step, only when the poll found work:
+
+```
+npm install -g @anthropic-ai/claude-code@2.1.296
+```
+
+The pin keeps the undocumented event shape stable. Every Claude session runs on the same install (issue #314), so the pin also fixes the session flags and what the model aliases mean. To change the version, edit that step, then run the dispatcher once with `workflow_dispatch` and check that the `[RESERVE]` line still shows both windows and the `[SESSION]` line shows `success` and `apiKeySource none`. `tests/test_dispatcher_workflow_allowance.py` checks that the version here matches the workflow.
+
+### Outcomes and log lines
+
+| Exit | Decision | Log line (stderr of the script) | Dispatcher behavior |
+|---|---|---|---|
+| `0` | `start` | `[RESERVE] five-hour 79% left (reserve 10%), weekly 71% left (reserve 20%) — start` | The session starts. |
+| `1` | `refuse` | `[RESERVE SKIP] weekly 15% left, below reserve 20%; resets 2026-10-14T08:00Z` or `[RESERVE HOLD] below reserve until 2026-10-14T08:00Z; not probing` | Before `/implement`: no session, no comment, no board write; the scheduler may choose the story again on a later poll, and the run exits 0. Before `/review`: no session, one comment on the story that names the step, the window, the share left, the reserve and the reset time, and the run exits 0. The comment is not posted again while it is already the story's newest comment for that step. |
+| `2` | `error` | `[ALLOWANCE ERROR] <reason> — starting nothing` | No session. The job fails, without a `dispatcher_error` Slack message. After `/implement`, the story gets the same comment with the reason. |
+
+A probe that is itself stopped by a usage limit (result error `rate_limit`) with no readable `rate_limit_event` is a `refuse`, not an `error`. An `overageStatus` other than `"rejected"` is an `error`: usage credits look turned on, so a session could be billed past the limit.
+
+A refusal partway through a cycle leaves the story at its current step. A story in the merge step is not affected: its `/merge` is a script and never checks the allowance (issues #293, #264). A refusal or an error before a fix round writes nothing: no comment is posted, and the fix round is tried again on a later run, before new work. For `/review` a later poll tries the step again once the allowance allows it. `/merge` and `/cleanup` are script-only and are never refused or held by the allowance (issue #264). Under `--dry-run`, the dispatcher logs `[DRY RUN] Would check subscription allowance before /<step>` and does not run the script.
+
+The script prints exactly one JSON object on stdout in every exit path:
+
+```json
+{
+  "decision": "start | refuse | error",
+  "source": "probe | hold | none",
+  "reason": "string; empty on start",
+  "five_hour": { "utilization": 0.21, "remaining_percent": 79, "reserve_percent": 10, "resets_at": "2026-10-10T15:00:00Z" },
+  "weekly":    { "utilization": 0.29, "remaining_percent": 71, "reserve_percent": 20, "resets_at": "2026-10-14T08:00:00Z" },
+  "api_key_source": "none",
+  "overage_status": "rejected"
+}
+```
+
+Values that were not read are `null`. `remaining_percent` is rounded down for display (and shown as `0` when utilization is above 1); the decision uses the unrounded value.
+
+### The hold
+
+A refusal from a probe writes `.dispatcher-allowance/hold.json` (override with `ALLOWANCE_STATE_DIR`) with `until` set to the latest reset time among the windows below the reserve, and the two reserve values in force. Until that time, and while both reserve values are unchanged, the script refuses with `source: "hold"` and does not run Claude Code. The remaining share only goes up at a reset, so no chance to start is lost. A missing, unreadable or malformed hold file means the script probes; it never means a start without a probe.
+
+The hold lives in the same `actions/cache` entry as the usage limit's session count, whose key changes every UTC day. A hold therefore lasts at most until the next UTC day; after that, one probe re-creates it.
+
+### A repeated `[ALLOWANCE ERROR]`
+
+An `[ALLOWANCE ERROR]` on every poll with work most likely means the undocumented `rate_limit_event` shape has changed, or the token has expired. Each such run fails visibly in Actions (and in GitHub's failed-run email) but sends no Slack message. The remedy is to set `DISPATCHER_ENABLED=false`, read the reason in the log, and either renew the token or revisit ADR-012.
+
+## Refinement sessions
+
+`bash scripts/dispatcher-invoke.sh --repo <owner/repo> --refine <n> [--dry-run]` starts one refinement session for issue `<n>` (issue #319, ADR-012, Feature #460 criterion F2.5). It runs `.claude/commands/refine.md` with `$ARGUMENTS` set to `<n>` through `invoke_executor_command()`, so the token cleaning, the `ANTHROPIC_*` scrub, `CLAUDE_SESSION_ARGS`, the session count and the log lines are the implementation session's. `<n>` must be a positive whole number; `--refine` cannot be combined with `--issue` or `--resume` (exit `1`, nothing starts).
+
+**How it starts.** In the scheduled run a `refine #N` decision of the [scheduler](#scheduler-new-work-from-github-facts) starts it, after the work in flight (issue #474), and the run ends after the session. A manual run also starts it: **Actions → Dispatcher → Run workflow**, with the input `refine_issue` set to the issue number. With `refine_issue` set the run passes the guard, installs Claude Code, restores the session state cache and runs only `dispatcher-invoke.sh --refine <refine_issue>` in the "Run dispatcher invoke" step, whatever the poll found; the usage-limit notification step is unchanged. With `refine_issue` empty the run is as before.
+
+**Tier.** The model comes from the issue's type, not from its `executor:` label: `type:epic` and `type:feature` run on `opus`, every other issue (`type:story`, `type:task`, `type:bug`, or no `type:` label) on `sonnet`. The rule is fixed in `refine_executor_label()`; there is no repository variable for it.
+
+**Gates, reused.** The pause switch (`DISPATCHER_ENABLED` not `true`: the workflow guard starts nothing, also with `refine_issue` set), the usage limit ([Usage limit](#usage-limit): a refinement session counts once, when it starts) and the allowance check ([Subscription allowance and reserve](#subscription-allowance-and-reserve): below the reserve in either window, no session starts). A refused start posts the same one comment on the issue as for `/review` and exits as for any session.
+
+**One session, no branch.** The mode starts exactly one model session and then exits: no resume pass, no `/implement`, no `/review`, no `/merge`, no `/cleanup`, no chained story. The dispatcher runs no `git push`, no `git checkout -b` and no `gh pr create` and writes no board status; the board writer shows the issue's status from its facts. The workflow's `concurrency` group still serializes runs.
+
+**Outcomes and log lines.**
+
+| Outcome | Run | Written |
+|---|---|---|
+| Session finished (`result` success) | exit `0`, `[REFINE] #<n>: /refine finished` | if the session left an open decision blocker, one `decision_blocker` event (as after `/implement`) |
+| Provider usage limit (`rate_limit`) | exit `0`, `[SESSION RATE LIMIT] /refine #<n> ...` | one `## Paused at a provider usage limit` comment with step `/refine <n>`; no board write, no `dispatcher_error`; a later `--refine <n>` starts a new session from the issue as it is |
+| Failed session, wall-clock stop or 401 | exit `1`, `[SESSION ERROR]` line | the failure blocker and `po_blocker` event of a failed `/implement`; the 401 text is the same (run `claude setup-token` again and save the secret with nothing before or after it) |
+
+`[REFINE] #<n>: starting /refine on <model>` is logged before the gates run. `--dry-run` prints `[DRY RUN] Would start Claude Code (<model>) on the subscription for /refine <n>` and starts nothing.
+
+**After `/unblock`.** A refinement decision blocker answered with a standalone `/unblock` line is resumed by a fresh `--refine <n>` session that reads the answer (`refine.md` → Tech Lead rules → Resume after `/unblock`). The mode posts no CLAIM or CONFIRM marker and moves nothing. Deciding when that session is due is #473.
+
+## Pause at a provider usage limit
+
+A session stopped by the subscription's provider usage limit (issue #316, ADR-012) is not a failure and needs no PO action: the limit ends by itself at the reset.
+
+**Detection.** `claude_limit_stop` in `scripts/lib/claude-session.sh` decides it from the session's stream: a final `result` that is not a success (`is_error` true or `subtype` not `success`) and has `rate_limit` or `rate_limit_error` in `error`, `subtype`, `error_type` or `error_category`, or `api_error_status` 429; or a `rate_limit_event` with `rate_limit_info.status` `rejected` when the stream has no successful result. Everything else (non-zero exit without a limit signal, wall-clock bound, 401, `apiKeySource` not `none`, missing `result`) stays a session error with the mid-cycle blocker. `run_claude_code_session()` returns `75` for a limit stop and sets `CLAUDE_LIMIT_RESET_TS` to the reset time in Unix seconds (`rate_limit_info.resetsAt`, else the latest `unifiedWindows.*.resetsAt` at utilization 1 or more), or to an empty string. `invoke_executor_command()` passes the code through.
+
+**Placement.** The run exits `0` and starts no other session.
+
+| Session | Story afterwards | Written |
+|---|---|---|
+| New `/implement` (Step E1) | no board write; the next start continues on the existing branch and PR | the pause record |
+| Fix round, no new head | no board write; the same round starts again on a later poll | the pause record; no fix-round attempt marker, no merge-owner marker |
+| Fix round that pushed a new head (issues #446, #447) | handed off, the Codex review requested for the new head (the bookkeeping job posts a missing review request); no board write | in the same run: the merge-owner marker for the new head, the usual hand-off, then the pause record saying the head was handed off; no fix-round attempt marker, nothing read back later; the dispatcher posts no review request itself |
+| Fix round that pushed a new head while the PR is still a draft (issue #446) | no board write | the pause record says the head is not ready for review; no merge-owner marker, no hand-off, no blocker (a draft PR is outside the missing-merge-owner rule) |
+| `/review` of a Codex-implemented PR | no board write | the pause record; no per-head review attempt marker |
+| Conflict round | no board write; the next run decides from the PR ([conflict round](#conflict-round)) | the pause record with step `conflict round`, for the PO only; no marker |
+
+No `## Blocked Declaration` is posted, no Slack message is sent and no actionable event is registered.
+
+**The record.** One comment headed `## Paused at a provider usage limit` names the step and target, the branch, the PR number and head SHA (or `no PR yet`), the reset time in UTC (or `unknown — the dispatcher checks the allowance on every poll`), the commits the runner had not pushed and whether it had uncommitted changes, what the dispatcher does next, and "No PO action is needed." It is not posted again while it is the story's newest comment for the same step and PR head. The run log has one `[SESSION RATE LIMIT]` line.
+
+**Restart.** There is no timer. The usage limit check and the allowance check with its hold refuse every start until the window has reset, and a restart is counted by the usage limit like any session, which bounds a loop of limit stops. `/implement` continues on an existing branch for the story, with or without a PR (`.claude/commands/implement.md` steps 9 and 10).
+
+**What is lost.** Only commits the session pushed survive: the next runner is fresh. The dispatcher does not commit or push leftover work, so half-done changes never reach the PR; the record counts what was not pushed.
+
+## Local Codex worker
+
+`executor:codex` work runs on the PO's computer, not on the Actions runner (ADR-012 → Codex Plus amendment, issue #528). A scheduled task in the signed-in Codex app runs `scripts/codex-worker.sh`, which is `hpw dispatcher codex-worker` (code in `src/headless_pr_workflow/dispatcher/codex_worker.py`). The worker selects one queued item, claims it on GitHub and prints the invocation that the task's session follows. It never writes a board status or a label, never starts Claude, and keeps no local state: every fact it decides from is on GitHub, so any later run on any computer reads the same answer. The Actions dispatcher still skips `executor:codex` stories at `/implement` and reviews a Codex PR in `In review` as described under [Review of a Codex-implemented PR](#review-of-a-codex-implemented-pr).
+
+### Setup
+
+Prerequisites on the computer:
+
+- The Codex app, signed in with the PO's ChatGPT Plus account, running while tasks are due. The computer must be on and awake; when it is not, no task runs and the work waits (see [Recovery](#recovery)).
+- A clone of the repository on disk, opened as the task's project, with `bash` (Git Bash on Windows), Python 3.11 or later and `git` able to push to the repository.
+- `gh` 2.50 or later, signed in as the PO (`gh auth login`), with the `repo` scope (issues, comments, pull requests, branches, compare) and the `project` scope (the board read; the `/implement` contract of #523 also writes board statuses with it). The worker reads the board, issues, comments, branches (`git/matching-refs`), pull requests and comparisons, and writes only issue comments.
+- No `OPENAI_API_KEY` or `CODEX_API_KEY` in the task's environment. `claim` refuses to start while either is set (`refused`, reason `api-key-set`), so no session can fall back to metered API billing.
+
+Environment of the task:
+
+| Variable | Meaning | Default |
+|---|---|---|
+| `CODEX_WORKER_ID` | Name of this computer in the claim (`owner=`); a word such as `po-laptop`. Required for `claim` (or `--owner`). | none |
+| `CODEX_WORKER_RUN_ID` | Name of one task run (`run=`). A retry of the same run passes the same name; a new run leaves it unset and gets a fresh one. | a random word |
+| `CODEX_WORKER_ELIGIBILITY_COMMAND` | The fail-closed eligibility hook (#524): called as `<command> --repo <r> --issue <n> --command <c>`. Exit `0` is eligible; exit `1` is not, with an optional `{"reason": "<word>", "detail": "<one line>"}` on stdout; any other exit, a timeout of 60 seconds or a command that cannot start is `eligibility-unreadable`. Unset is `eligibility-unconfigured`. Every answer but exit `0` starts nothing. | unset: nothing starts |
+| `CODEX_WORKER_LEASE_MINUTES` | How long a claim holds without a new record before a later run treats the session as interrupted. | `240` |
+| `CODEX_WORKER_RETRY_MINUTES` | How long an attempt that ended with `wait` and no `--until` waits before the next attempt. | `60` |
+
+Leave the hook unset and the worker starts nothing, as ADR-012 requires when the allowance cannot be confirmed. Set it to `bash <repo>/scripts/codex-eligibility.sh` (see [Eligibility command](#eligibility-command)) so the worker starts only above the subscription reserves.
+
+#### Eligibility command
+
+`scripts/codex-eligibility.sh --repo <r> --issue <n> --command refine|implement` (issue #542, `src/headless_pr_workflow/dispatcher/codex_reserve.py`) answers the worker's hook contract: exit `0` is eligible, exit `1` is not and prints `{"reason": "<word>", "detail": "<one line>"}`, exit `2` (bad arguments or an unexpected error) reads as `eligibility-unreadable`. The worker's `codex-wait` text carries the reason and the detail (window, share left, reserve, reset time), once per attempt and reason, so a replay posts no second one and the next run after the reset asks again.
+
+Every session start (new attempt, resume, fix round) needs the Codex Plus five-hour and weekly shares at or above the reserve; equality starts. Only **new** Codex work, a story with no `codex/issue-<n>-*` branch yet, also needs Claude review capacity: the Claude allowance at or above the existing Claude reserve, and fewer Codex PRs waiting for a Claude review than the limit. A resume or a fix round skips these two checks, because it shrinks the review queue. A Codex PR waits for a Claude review when it is open, ready for review, on a `codex/issue-<n>-*` branch and has no submitted review (other than the Codex connector's) of its current head.
+
+Checks run cheapest first, and a refusal stops the rest: variables, the Codex reading, the review queue, the Claude probe. The command starts no model session other than the Claude allowance probe, starts no Claude work for the item, and never reads an OpenAI API key (`OPENAI_API_KEY` and `CODEX_API_KEY` are removed from the probes' environment).
+
+| Variable | Meaning | Default |
+|---|---|---|
+| `CODEX_RESERVE_FIVE_HOUR_PERCENT` | Share of the Codex five-hour allowance that must be left. Whole number 0–100; empty is the default. | `10` |
+| `CODEX_RESERVE_WEEKLY_PERCENT` | The same for the weekly allowance. | `20` |
+| `CODEX_REVIEW_QUEUE_MAX` | New Codex work starts only when fewer Codex PRs than this wait for a Claude review. Whole number of 1 or more. | `1` |
+| `CODEX_ALLOWANCE_COMMAND` | Required. A command on the PO's computer that prints one JSON object, `{"five_hour": {"remaining_percent": <0-100>, "resets_at": "<iso>"}, "weekly": {...}}`, from the signed-in Codex app or CLI, with exit `0`. It must not make a metered API call. Unset or any other result is `allowance-unreadable`. | unset: nothing starts |
+| `CODEX_ALLOWANCE_TIMEOUT` | Seconds the Codex reading may take. | `20` |
+| `CLAUDE_ALLOWANCE_COMMAND` | Test hook: replaces `scripts/dispatcher-allowance.sh`, which runs unchanged (exit `0` start, `1` refuse, anything else unreadable) with `RESERVE_FIVE_HOUR_PERCENT` and `RESERVE_WEEKLY_PERCENT`, so no second Claude reserve exists. | the allowance script |
+| `CODEX_CLAUDE_PROBE_TIMEOUT` | Seconds the Claude probe may take (it also gets `ALLOWANCE_PROBE_TIMEOUT` `25` unless set). | `35` |
+
+The worker gives the hook 60 seconds, so keep the two probe timeouts together below that. The Claude probe needs `CLAUDE_CODE_OAUTH_TOKEN` in the task's environment, as `scripts/dispatcher-allowance.sh` does. Setup on the PO's computer: set `CODEX_WORKER_ELIGIBILITY_COMMAND` to an explicit Bash command with the script's quoted, forward-slash full path, for example `bash "C:/work/headless-pr-workflow/scripts/codex-eligibility.sh"` (or `bash /home/po/headless-pr-workflow/scripts/codex-eligibility.sh`), and `CODEX_ALLOWANCE_COMMAND` to the reading command. The worker runs the hook without a shell, so native Windows Python cannot execute a bare `.sh` path: always name `bash` (Git Bash on Windows, never WSL's `C:\Windows\System32\bash.exe`) and use forward slashes, because the command is split like a POSIX shell line and a backslash would be dropped. The Plus allowance reading may be undocumented; when its shape changes the command answers `allowance-unreadable`, never eligible, and ADR-012 requires a new PO decision if no readable form exists.
+
+Reasons (the `reason` word, also in the `codex-wait` marker):
+
+| Reason | Meaning |
+|---|---|
+| `codex-reserve` | A Codex window is below its reserve; the detail names the window, the share left, the reserve and the reset time. |
+| `reserve-config` | A `CODEX_RESERVE_*` or `CODEX_REVIEW_QUEUE_MAX` value is invalid; no probe ran. |
+| `claude-reserve` | New work only: the Claude allowance is below the Claude reserve. |
+| `review-queue` | New work only: the number of Codex PRs waiting for a Claude review is at the limit. |
+| `allowance-unreadable` | A Codex or Claude allowance could not be read (no command, failed, timed out, changed shape). |
+| `review-queue-unreadable` | The review queue or the story's branches could not be read from GitHub. |
+| `eligibility-unreadable` | The worker got an exit other than `0` or `1`, a timeout or a command that could not start. |
+
+The task: create one automation in the Codex app for the repository's project, running every 30 minutes, with this prompt:
+
+> Run `scripts/codex-worker.sh claim --repo LauraMardones/headless-pr-workflow`. If it exits non-zero, stop. Otherwise read `invocation` from its JSON line and follow `invocation.command_file` for `invocation.issue`. When `invocation.resume` is set, continue on that branch and PR from that head; never open a new branch or PR. After each push run the `invocation.progress` command with the branch, the full head SHA and the PR. At the end run the `invocation.finish` command: `--result done --head <full-sha>` (the full 40-character SHA, as `git rev-parse HEAD` prints it) after the hand-off, or `--result wait --reason <word>` (for example `usage-limit` with `--until <reset time>`) when the session cannot finish.
+
+Thirty minutes keeps at most one idle read of the board per half hour; the lease, not the interval, bounds how long a stopped session blocks its item.
+
+### Queue and claim
+
+The queue is every open issue on the board with exactly one `executor:` label, `executor:codex`, a `type:story`, `type:task` or `type:bug` label, and one of these statuses. The status names the HPW command of the invocation (the boundary for #523):
+
+| Board status | Command | Order |
+|---|---|---|
+| `In implementation` | `implement` (continue, or the fix round of #523) | first |
+| due for story refinement (any other status) | `refine` | then |
+| `Ready to implement` | `implement` | then |
+
+An `executor:codex` story, task or bug is *due for story refinement* when the scheduler's rules for story refinement choose it (see [Scheduler: new work from GitHub facts](#scheduler-new-work-from-github-facts): parent Epic with a merged spec and a current record, refined parent Feature, ready buffer open, no open decision blocker). `claim` reads the same facts and limits as the Actions scheduler (`scheduler.codex_refine_due`; `WIP_LIMIT_IMPLEMENTATION`, `READY_BUFFER_MIN` and `READY_BUFFER_MAX` must be set, or no `refine` entry is queued and the log says why); stories with the board status `In implementation` count for the WIP limit. Every other story with work in flight is passed as the scheduler's `--in-flight` list, found as in [Work in flight from PR facts](#work-in-flight-from-pr-facts): an open PR that closes it, draft or not, or, without one, an open Blocked Declaration of type `dependency`, `external`, `conflict` or `resource` that no later PO `/unblock` line lifts (`codex_worker.work_in_flight`). So a stale record of a story in review is refined whatever the ready buffer holds. Facts or open PRs that cannot be read make `claim` `unreadable`; comments that cannot be read add no blocker for that story, as on the Actions path. Feature and Epic refinement stay with Claude on the Actions path. The Actions scheduler never chooses an `executor:codex` story, task or bug for refinement (`[SCHEDULER] skip #<n> codex-assigned`).
+
+Within a status the lowest `prio:P<n>` comes first, then the lowest issue number. One run claims at most one item.
+
+Every fact is a hidden marker on the issue, written through [GitHub writes](#github-writes--hpw-dispatcher-write) and read through [Markers](#markers--hpw-dispatcher-marker): only comments of the login behind `gh` (`DISPATCHER_LOGIN` when set) count.
+
+| Marker | Written by | Fields |
+|---|---|---|
+| `codex-claim` | `claim` | `issue`, `attempt`, `owner`, `run`, `command`, and the `pr`, `branch` and `head` the attempt resumes (`-` for none) |
+| `codex-progress` | `progress`, after each push | `issue`, `attempt`, `run`, `pr`, `branch` (`codex/issue-<n>-<slug>`), `head` |
+| `codex-renew` | `claim`, when a replay continues its claimed attempt | `issue`, `attempt`, `run` |
+| `codex-end` | `finish`, or a later run for an interrupted attempt | `issue`, `attempt`, `run`, `result` (`done` or `wait`), `reason`, `head`, `until` when given, and `by` (the recovering run) on an interruption |
+| `codex-wait` | `claim`, when an item cannot be claimed, or a replayed run cannot start its claimed attempt | `issue`, the `attempt` it waits before (or the claimed attempt it waits to start), `reason` |
+
+The claim rule, for each item:
+
+1. Read the item's markers. A marker that cannot be parsed, or a `codex-progress` or `codex-end` of a run that does not own its attempt, is a conflict: nothing starts, and one `codex-wait` with reason `conflicting-claim` is posted.
+2. The owner of an attempt is the claim with the **lowest comment id** for that attempt number. Comment ids grow with time, so every reader agrees, whatever order the runs read in.
+3. The newest attempt is *held* while it has no `codex-end` and its newest claim, progress or renew record is younger than the lease; the run skips the item (reason `claimed`) and writes nothing. After the lease it is *interrupted*: the run posts `codex-end result=wait reason=interrupted by=<run>` for it, reads the markers back and continues with step 5, with no retry wait. An interruption counts only when, by GitHub's own timestamps, the attempt's newest claim, progress or renew record before it (lower comment id) is older than the lease. So an owner record that lands between the run's read and its interruption keeps the attempt with its owner, and so does a computer clock ahead of GitHub's: the run then skips the item (reason `lease-held`) and starts nothing. Any other write that landed first is judged by the same rules on the read-back: after the owner's own `codex-end` its `until` (`retry-later`) or its handed-off head (`handed-off-on-head`) applies, and after another run's recovery that run's new attempt holds the item (`claimed`; a replay reports `lost`). Only the run's own counted interruption lets it continue at once.
+4. After a `codex-end result=wait`, the next attempt waits until its `until`, or for the retry interval (reason `retry-later`, nothing written). After `codex-end result=done` of an `implement` attempt, no new `implement` attempt starts while the branch head is still the handed-off head (reason `handed-off-on-head`); a finished `refine` attempt suppresses neither the first implementation nor a later re-refinement; #523 decides when a fix round on that head is due.
+5. The resume facts are checked against GitHub (see [Recovery](#recovery)).
+6. The eligibility hook is asked. A refusal posts one `codex-wait` with the hook's reason and ends the run: the reserve is shared, so no other item is tried.
+7. The run posts its `codex-claim` for the next attempt number, reads the markers back, and starts only when its own claim owns the attempt (`claimed`, exit `0`). Otherwise it reports `lost` (exit `1`); its claim stays on the issue as a losing claim that the rule ignores.
+
+A replay of a run (the same `CODEX_WORKER_RUN_ID`, or `--run`) finds its newest own claim first and claims nothing new. It looks for that claim on every board issue with `executor:codex`, whatever its status or state, because its session may have moved the item out of the queue (for example to `In review`). When the claimed item is no longer queued and its attempt is still open, the replay starts nothing and claims no other item (`waiting`, reason `not-queued`). A run with no name gets a fresh one and reads only the queued items. Otherwise the replay reports `continued` with the same attempt while it owns the open attempt within the lease, the remote resume facts still check out and the eligibility hook still answers eligible (a replay starts the session too, so it resolves the branch, PR and current head again exactly as a new claim does, and so resumes a branch the session pushed before it could record progress; then it asks the hook again; a resume reason such as `pr-closed` or a hook refusal keeps the claim, posts one `codex-wait` for the claimed attempt with that reason and reports `waiting`, and an unreadable read reports `unreadable`; the lease may run out during these reads and the hook, so the replay then posts `codex-renew` for the attempt, reads the markers back and continues only when it still owns the open attempt: an interruption that landed before the renewal ends the attempt and the replay reports `lost`, and a renewal that landed first keeps the attempt, as any record within the lease does), `lost` when another run owns it, `ended` after its `codex-end`. After the lease a replay does not continue the attempt, because a new run may already treat it as interrupted: it takes steps 3 to 7 for that item only, posting `codex-end … reason=interrupted` for its own attempt and claiming the next attempt under the same run, so it starts only on a newly won attempt (`claimed`), and reports `lost` when another run recovered the item first. A claim write whose response was lost is found on the re-read before any retry (Block 1), so it is never posted twice and never becomes a new attempt; `progress` and `finish` post their marker once, so a retried call reports `already`. Both read the markers back after the write: when a run's interruption landed before their record, the attempt is no longer the session's, and they report `not-owner` so the session stops.
+
+### Session runbook
+
+What the scheduled Codex task's session does with a `claim` result (`claimed` or `continued`; issue #535). The rules of each command stay in its command file; the runbook only says how to start it and how to record progress and the end. A Codex session leaves the same evidence on GitHub as a Claude session.
+
+1. **Fail closed first.** The session needs `gh` 2.50 or later with GraphQL access (`gh auth status`, and a GraphQL read such as `gh api graphql -f query='{viewer{login}}'`). When it is missing, or the session cannot read a required check (`refine-check`, `ac-summary`, the `pytest` check of the PR head), it runs `finish --result wait --reason gh-graphql-missing` (or `required-check-unreadable`) and reports the story as neither refined nor ready for implementation, and the PR is not marked Ready for review. `refine-check`, `ac-summary` and the required `pytest` check are never skipped. No `OPENAI_API_KEY` or `CODEX_API_KEY` is read or needed; `claim` refuses while one is set.
+2. **Worktree and branch.** Work in a worktree (`docs/WORKTREE-MODEL.md`) on a branch whose name starts with `invocation.branch_prefix`. With `invocation.resume` set, continue on `resume.branch` from `resume.head` and on `resume.pr`; open no second branch or PR.
+3. **`command: refine`.** Follow `.claude/commands/refine.md` with the issue number. The refined body, the passing `refine-check` run and the `## Session Summary` comment are the evidence. When it ends done, run `finish --result done --head <sha>` with the current `main` head the refinement used; a decision blocker ends with `finish --result wait --reason decision-blocker`.
+4. **`command: implement`.** Follow `.claude/commands/implement.md`. After each push run `invocation.progress` with the branch, the full head SHA and the PR. Mark the PR Ready for review only when the required `pytest` check is green on the current head, with the implementation handoff and Session Summary. An `executor:codex` story gets no Codex review trigger comment (ADR-006); its paired Claude `/review` session reviews the head. End with `finish --result done --head <full-sha>` naming the handed-off head.
+5. **Any other stop** ends with `finish --result wait --reason <word>` (`usage-limit` with `--until`, a blocker word, or the reasons in step 1).
+
+### Codex review and fix-round cycle
+
+One `executor:codex` story goes through this cycle, and `tests/test_codex_review_fix_cycle.py` runs it end to end with fakes (issue #575; no model session runs):
+
+1. The worker's `implement` attempt pushes a head, marks the PR Ready for review and ends with `finish --result done --head <sha>`.
+2. The review step ([Review of a Codex-implemented PR](#review-of-a-codex-implemented-pr)) starts one Claude `/review` on that PR head, once per head. Claude is the only reviewer of an `executor:codex` PR: no Codex review request is posted for it (ADR-006).
+3. A review with blockers on the head returns the story to `In implementation`. `claim` then starts a fix round: an `implement` attempt on the same PR and branch (`invocation.resume`, plus `invocation.fix_round` with `round`, `max`, `pr` and `reviewed_head`). The round needs a review of the handed-off head from a trusted account other than the Codex bot, with blockers or `CHANGES_REQUESTED`; one round runs per reviewed head, and the worker never opens a second PR or branch.
+4. The fix round pushes a new head to the same PR and ends with `done` on it. The new head gets its own Claude `/review`, once; the first review's result is never reused for it.
+5. A review of the new head with no blockers leaves the PR in the merge step; the script-only `/merge` and `/cleanup` run as for any story. A review with blockers starts the next fix round at step 3.
+
+**Fix-round maximum.** `CODEX_FIX_ROUND_MAX` (a whole number of `1` or more, default `3`, set in the worker's environment) bounds the rounds per PR: the round number is the count of reviewed heads of that PR with blockers. When the next round would be above the maximum, `claim` starts no session, posts one `Type: resource` blocker on the story naming the PR (marker `action=fix-round-max pr=<pr>`, posted once) and returns `waiting`; the story stays with Codex and the PO decides. Raising the variable lets the next round start. The dispatcher's own `CODEX_FIX_ROUND_MAX` for Claude-tier stories ([Fix round](#fix-round)) counts different facts and is separate.
+
+**No failover.** The dispatcher starts no Claude `/implement`, and no Claude fix round, for an `executor:codex` story in any status or on any code path (ADR-012): a Codex story whose fix round cannot start waits for Codex or the PO.
+
+### Recovery
+
+`claim` resumes from the newest `codex-progress` (or the newest claim that named a branch) and checks it against GitHub before it starts:
+
+| Check | When it fails | Reason |
+|---|---|---|
+| The recorded branch still exists | the branch was deleted | `branch-missing` |
+| The branch head is the recorded head, or contains it (compare `ahead`) | the branch was rewritten | `head-diverged` |
+| The recorded PR is open and its head branch is the recorded branch | closed or merged, gone, or another branch | `pr-closed`, `pr-missing`, `pr-branch-mismatch` |
+| With no record: at most one `codex/issue-<n>-*` branch and at most one open PR on it | two candidates | `ambiguous-branch`, `ambiguous-pr` |
+| No open PR from another branch closes the issue | someone else holds the work | `foreign-pr` |
+
+A failed check posts one `codex-wait` with the reason and starts nothing; the PO resolves it. A passing check puts the current remote head in the claim and in `invocation.resume`, so the session continues on the existing branch and PR with every pushed commit, including commits pushed after the last progress record. With no branch and no record, the session starts fresh under `invocation.branch_prefix`.
+
+The recovery sequence after each kind of stop:
+
+1. **Session interrupted** (app closed, computer asleep or off, crash): nothing is written until the next run after the lease. That run posts `codex-end … reason=interrupted by=<run>` for the old attempt, reads it back, and claims the next attempt from the recorded branch and the current remote head. The interrupted session can no longer record progress or an end (`not-owner`). A session that was only slow and records progress before the interruption lands keeps its attempt (`lease-held` for the other run).
+2. **Usage limit:** the session runs `finish --result wait --reason usage-limit --until <reset>`. Runs before the reset skip the item (`retry-later`); the first run after it claims the next attempt and resumes.
+3. **GitHub unreadable** (the board, the comments, the login, a branch or a PR): `unreadable`, exit `3`, nothing written and nothing started. The item keeps the state GitHub shows, and the next run decides again.
+4. **Not eligible** (the reserve, or no hook): one `codex-wait` per attempt and reason; the next run asks again.
+
+No path moves an item to Claude, changes its `executor:` label or writes a board status.
+
+### Commands and output
+
+```
+scripts/codex-worker.sh claim    --repo <owner/repo> [--owner <id>] [--run <id>] [--dry-run]
+scripts/codex-worker.sh progress --repo <owner/repo> --issue <n> --attempt <k> --run <id> --branch codex/issue-<n>-<slug> --head <full-sha> [--pr <n>] [--dry-run]
+scripts/codex-worker.sh finish   --repo <owner/repo> --issue <n> --attempt <k> --run <id> (--result done --head <full-sha> | --result wait --reason <word> [--until <iso>]) [--dry-run]
+scripts/codex-worker.sh status   --repo <owner/repo>
+```
+
+- **stdout:** one JSON line (`ok`, `block: "codex-worker"`, `operation`, `result`, `error`). `claim` adds `owner`, `run`, `issue`, `attempt`, `skipped` (each item it passed over, with `reason` and, where it posted one, the `evidence` result of its `codex-wait`) and, for `claimed` and `continued`, `invocation`: `repo`, `issue`, `attempt`, `owner`, `run`, `command`, `command_file`, `branch_prefix`, `resume` (`pr`, `branch`, `head`, or `null`), and the `progress` and `finish` command lines. `status` lists each queued item with its state (`free`, `held`, `expired`, `conflict`), attempt, owner, run, end and recorded facts: the operator's view, read from GitHub only.
+- **Heads:** `--head` takes the full 40-character SHA, the form GitHub reports, and the worker stores it in lower case; an abbreviated SHA is an invalid argument (exit `2`), because the worker compares recorded heads with the remote head.
+- **Exit codes:** `0` `claimed`, `continued`, `written`, `already`, `read`, `dry-run`; `1` `idle`, `waiting`, `lost`, `ended`, `refused`, `not-owner`, `failed`; `2` invalid arguments or an invalid `CODEX_WORKER_*_MINUTES`; `3` `unreadable`.
+
+## The dispatcher script is read completely before any session starts
+
+bash reads a script from the file in pieces, so a session that rewrites `scripts/dispatcher-invoke.sh` while the run waits for it (any story that changes the dispatcher does) could make the run resume in the middle of a line (issue #345). The whole body of the script is therefore one brace group closed by `}; exit $?` on a single line: bash parses it completely before the first session starts, and nothing is read from the file afterwards. Keep it that way: no code after the group.
+
+The `exec bash "$0"` tail calls start a new process on purpose, so the next story runs the code that was just merged. The other files are safe: `scripts/lib/claude-session.sh`, `scripts/lib/decision-blocker.sh` and `scripts/lib/evidence-pending.sh` are sourced once at start, and `dispatcher-usage-limit.sh`, `dispatcher-allowance.sh`, `slack-notify.sh`, `dispatcher-change-check.sh`, `session-summary.sh` and `hpw dispatcher write` (issue #432) run as separate processes that read the file at call time. Any new script the dispatcher sources after a session, or runs for the length of a session, needs the same treatment; check `dispatcher-merge.sh` and `dispatcher-cleanup.sh` (#264) when they land.

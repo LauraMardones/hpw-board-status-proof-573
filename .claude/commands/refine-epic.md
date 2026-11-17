@@ -1,0 +1,333 @@
+Act as the Tech Lead (`docs/ROLES.md`) with GitHub access.
+
+Refine the following GitHub epic until it meets the project's refinement standard.
+
+Repository:
+LauraMardones/headless-pr-workflow
+
+Issue:
+#$ARGUMENTS
+
+Do not implement code.
+
+Follow the `## Tech Lead rules` in `.claude/commands/refine.md`: spec lookup and check, no refinement without a merged spec, the spec record, decision blockers instead of questions to the PO, resume after `/unblock`, lens questions and usage findings. Ask the PO nothing in the session.
+
+## Core Instructions
+
+- Fetch the current GitHub issue title, body, labels, linked issues, and relevant comments.
+- Inspect relevant repository docs and roadmap before changing the issue.
+- Update the GitHub issue body directly with the refined epic.
+- Do not only return the refined epic in chat.
+- GitHub must remain the source of truth.
+- Preserve useful existing content, but reorganize it into the project epic format.
+- Do not discard prior decisions, constraints, dependencies, or context unless clearly obsolete.
+- If something appears obsolete, move it to Notes instead of deleting it silently.
+- If you do not have permission or tooling to update GitHub, stop and say exactly what is missing.
+
+## Outcome
+
+Refinement writes no board status and no status line in the issue body. The outcome is a fact in the Session Summary, as `Next action:`:
+
+- `Next action: Ready for implementation`: the contract is clear, `refine-check` passed and no hard dependency is open.
+- `Next action: Refined; blocked by #X`: the contract is clear and `refine-check` passed, but hard dependencies are still open.
+- `Next action: Needs PO decision`: a decision blocker is declared on the issue.
+
+Never report `Ready for implementation` while hard dependencies are still unresolved.
+
+## Existing Issues Inventory
+
+Before creating any new issues, inventory what already exists:
+
+- Search GitHub for open and closed issues that reference this epic number in their body (`Parent epic: #X`).
+- Also check the epic body for any existing Seed Features or Seed Stories lists.
+- Classify each found issue by type (`type:feature`, `type:story`, `type:task`, `type:bug`) and state (open/closed).
+- Do not create a duplicate of any existing issue that already covers the same scope.
+- If an existing issue is misclassified, mislabeled, or missing its parent epic reference, note it in the refined issue rather than silently fixing it during this refinement.
+
+## Lens Selection
+
+Before breaking down the epic, apply refinement lenses to ensure the breakdown is sound:
+
+1. Read all `.md` files in `.claude/commands/refinement-lenses/`
+2. Always apply the `token-economics.md` lens (default, regardless of labels)
+3. Additionally, for each lens file whose `## Trigger Labels` section matches any of the current issue's GitHub labels, apply that lens as well
+4. For each active lens, answer its `## Lens Questions` yourself as the Tech Lead, record the answers under `## Decisions`, and incorporate the lens perspective into your analysis before proposing the breakdown; a lens question that needs a product choice becomes a `Type: decision` Blocked Declaration
+
+The lens questions will help identify:
+- Per-session token overhead problems that suggest different story/feature boundaries
+- Documentation work that should be clustered in a single story
+- Executor tier misalignments that need correction
+
+Proceed to the feature assessment and breakdown steps once each lens question is answered or raised as a decision blocker.
+
+## Feature Assessment
+
+Before breaking an epic into stories, assess whether a Feature level is warranted:
+
+**Create Features if:**
+- The epic contains more than ~6 stories (counting existing ones), OR
+- There are clearly distinct capability clusters that can be delivered and closed independently.
+
+**Skip Features and create stories directly if:**
+- The epic is small enough that all work is one coherent delivery.
+- A Feature would be a 1:1 wrapper around the epic with no grouping benefit.
+
+If Features are warranted:
+- Include existing `type:feature` issues in the Seed Features list.
+- Create new Feature issues only for capability clusters not yet covered.
+- Do not create Story/Task/Bug issues yet - that is the job of `refine-feature`.
+
+If Features are not warranted:
+- Include existing Story/Task/Bug issues in the Seed Stories list.
+- Create new issues only for scope gaps not yet covered by existing issues.
+
+Assign each Seed Feature its `k` by its place in the Seed Features list; once a Feature has its `F<k>` it is never renumbered, and a new Feature takes the next unused `k`.
+
+Always list all related issues in the epic body - both pre-existing and newly created.
+
+## Parent-Link Assignment
+
+After each new Feature issue is created and added to GitHub Projects, immediately set its parent link so the Epic → Feature hierarchy is visible on the board. Run this step for every newly created Feature before moving on.
+
+### How to set the parent link
+
+**Step 1 — Locate project item IDs**
+
+List all items in project #3 and find the relevant IDs:
+
+```
+gh project item-list 3 --owner LauraMardones --format json
+```
+
+Filter the output by `content.number` to find:
+- The Epic's project item ID (the `id` field matching the Epic's issue number)
+- The newly created Feature's project item ID
+
+If the Epic is not present in the project output, skip to Step 4.
+
+**Step 2 — Attempt `updateProjectV2ItemFieldValue`**
+
+Try setting the parent field using the Epic's project item ID:
+
+```
+gh api graphql -f query='
+  mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $parentId: String!) {
+    updateProjectV2ItemFieldValue(input: {
+      projectId: $projectId
+      itemId: $itemId
+      fieldId: $fieldId
+      value: { text: $parentId }
+    }) {
+      projectV2Item { id }
+    }
+  }
+' -f projectId="PVT_kwHOBBqYlM4BV_cG" \
+  -f itemId="FEATURE_PROJECT_ITEM_ID" \
+  -f fieldId="PVTF_lAHOBBqYlM4BV_cGzhRXJTY" \
+  -f parentId="EPIC_PROJECT_ITEM_ID"
+```
+
+If this mutation succeeds, the parent link is set — proceed to the next Feature.
+
+**Step 3 — Fallback: `addSubIssue` mutation**
+
+If Step 2 fails (the built-in PARENT_ISSUE field may not accept `updateProjectV2ItemFieldValue`), fall back to setting the relationship at the issue level. First obtain the issue node IDs:
+
+```
+gh issue view EPIC_NUMBER --json id --jq '.id'
+gh issue view FEATURE_NUMBER --json id --jq '.id'
+```
+
+Then run:
+
+```
+gh api graphql -f query='
+  mutation($parentId: ID!, $childId: ID!) {
+    addSubIssue(input: { issueId: $parentId, subIssueId: $childId }) {
+      issue { number }
+      subIssue { number }
+    }
+  }
+' -f parentId="EPIC_ISSUE_NODE_ID" -f childId="FEATURE_ISSUE_NODE_ID"
+```
+
+**Step 4 — Graceful failure**
+
+If the Epic item is not found in project #3, or if all mutation attempts fail, emit a warning and continue without blocking refinement:
+
+> Warning: Epic #NUMBER not found in project #3 — parent link not set for Feature #NUMBER. Continuing refinement.
+
+Do not fail or halt the refinement session if parent-link assignment cannot be completed.
+
+## Implementation Order Derivation
+
+After the breakdown is finalized, derive implementation order from the Dependencies fields on each seed feature or seed story:
+
+- Inspect each seed issue's `Hard depends on:` and `Soft depends on:` dependency lists.
+- Use hard dependencies to create step boundaries. Step 1 contains issues with no hard dependencies; Step 2 contains issues whose hard dependencies are satisfied by Step 1; continue until all placeable seed issues are placed.
+- Do not use soft dependencies to create step boundaries. Mention soft dependencies only when they are useful context inside an existing step.
+- Group issues that can run in parallel within the same step.
+- If a seed issue has an unresolved hard dependency outside the seed set, do not place it in a runnable step. List it under `Blocked / Unresolved Hard Dependencies` with the external dependency.
+- If the seed issue hard-dependency graph has a cycle, do not invent an order for the cyclic issues. List the cycle under `Blocked / Unresolved Hard Dependencies`.
+- If any seed issue is blocked by an external unresolved hard dependency or a cycle, report `Next action: Refined; blocked by #X`, not `Ready for implementation`, until those hard dependencies are resolved.
+- Document the derived sequence as numbered steps under `## Implementation Order` in the epic body.
+
+## Devil's Advocate Closing Step
+
+After the breakdown is proposed (whether features or stories), challenge it with this question:
+
+**"What is the minimum number of features or stories that correctly and completely implements this epic? Can any proposed features or stories be merged without losing clarity or parallelism?"**
+
+Review the proposed features/stories and ask:
+- Are there features or stories that could be combined without losing independent deliverability or parallel execution potential?
+- Is any feature or story duplicating work or setup cost that another already includes?
+- Would merging any pair of features or stories actually reduce complexity or coordination overhead?
+
+If merging is justified, modify the breakdown accordingly. If the breakdown is already minimal, document why each feature or story is necessary.
+
+## Refinement Standard
+
+Refinement is complete when the epic has:
+
+- clear Goal
+- clear Why / Background
+- Scope
+- Non-goals
+- Success Criteria (testable)
+- Spec record line (`Spec: [...] at `<commit>``)
+- Seed Features or Seed Stories (created as GitHub issues)
+- Implementation Order derived from seed issue hard dependencies
+- Blocked / Unresolved Hard Dependencies when any seed issue cannot be ordered
+- Dependencies (Hard / Soft)
+- Open Questions
+- Related epics
+
+## Open Questions Format
+
+Questions for the PO are not written here for the PO to answer in the session. A product question becomes a `Type: decision` Blocked Declaration posted on the issue (`.claude/commands/refine.md` → Tech Lead rules → Decision blockers), after the search for an existing answer in `docs/PROJECT-STATUS.md`, `docs/decisions/ADR-*.md`, `docs/HEADLESS-PR-WORKFLOW.md`, other relevant `docs/*.md`, and the parent Epic's and Feature's `## Decisions` sections. If an existing answer is found, record and follow it instead of escalating.
+
+The `## Open Questions` section of the issue body lists the link to each blocker comment while the issue is blocked, and reads `None.` before it moves to `Ready for implementation` (`scripts/refine-check` fails `open_questions` otherwise).
+
+## Decisions Format
+
+When a decision blocker is answered by the PO's `/unblock` reply, or the Tech Lead settles a lens question, record it under Decisions with the chosen option, rejected alternatives, date and comment link (when answered by the PO). Do not delete rejected options — they are part of the record. If a decision reverses a prior decision, add a new entry rather than editing the old one.
+
+Each decision must be structured as:
+
+```md
+### [Decision title] — YYYY-MM-DD
+**Chosen:** [Option name] — [brief reason in plain language]
+**Rejected:** [Option name] — [brief reason why not]
+```
+
+## Label Handling
+
+- Use only existing GitHub labels.
+- Do not invent new labels.
+- Apply `type:epic` if not already set.
+- If the correct label for priority or area is unclear, raise it as a `Type: decision` blocker.
+
+## Issue Body Format
+
+Update the issue body to this structure:
+
+```md
+Spec: [`specs/{EPIC_NUMBER}-{slug}/spec.md`]({blob link at the commit}) at `{commit}`
+
+## Goal
+
+...
+
+## Why / Background
+
+...
+
+## Scope
+
+- ...
+
+## Non-goals
+
+- ...
+
+## Success Criteria
+
+- [ ] ...
+
+## Seed Features
+
+If features are warranted (each Feature's `Criterion prefix: F<k>` is its place in this list, fixed when first listed and never renumbered):
+
+- #X Feature: ... (F1)
+- #Y Feature: ... (F2)
+
+## Seed Stories
+
+If no features needed:
+
+- #X Story: ...
+- #Y Task: ...
+
+## Implementation Order
+
+Step 1 — no hard dependencies (can start immediately, run in parallel):
+- #X ...
+- #Y ...
+
+Step 2 — hard depends on Step 1:
+- #Z ...
+
+Step 3 — hard depends on Step 2:
+- #W ...
+
+Blocked / Unresolved Hard Dependencies:
+- #A blocked by external hard dependency #B ...
+- #C blocked by cycle: #C -> #D -> #C
+
+## Dependencies
+
+Hard depends on:
+
+- #X ...
+
+Soft depends on:
+
+- #Y ...
+
+## Open Questions
+
+- <link to each decision blocker comment, or `None.`>
+
+## Decisions
+
+...
+
+## Related
+
+- ...
+```
+
+## Refinement Completeness Gate (mandatory)
+
+The last step of every refinement, is the deterministic check; the model is not the judge of its own completeness.
+
+- Run `python3 scripts/refine-check --issue <n> --repo LauraMardones/headless-pr-workflow`. It re-reads the issue and checks the `type:`, `executor:` and `prio:` labels, open hard dependencies, the required body sections, open questions and parent references. It reads no board.
+- Run it on every refinement, including a re-refinement of an issue that is already `Ready for implementation`.
+- Only exit `0` permits reporting `Refined` or `Ready for implementation`. Exit `1` (a named check failed) or exit `2` (the issue, labels or dependencies could not be read) forbids it.
+- On a non-zero exit: fix what can be fixed and re-run the check; if a failure remains, list the failing checks as blockers and do not report `Next action: Ready for implementation` or `Refined`.
+- `executor:` label rule: a `type:story`, `type:task` or `type:bug` issue carries exactly one existing `executor:` label (`docs/PROJECT-STATUS.md`); a `type:epic` or `type:feature` issue needs none. Apply it before the check, choosing among the repository's existing labels.
+- Any statement about labels in the reply or the Session Summary comes from the check output, not from memory or from the issue text.
+- The Session Summary `Checks run:` line carries the result: `refine-check — pass`, or `refine-check — fail: <check-ids>` / `refine-check — unreadable`. `none` is not valid for a refinement that reports a status.
+
+## Final Reply Format
+
+After updating GitHub, reply only with:
+
+- Issue URL
+- Next action: Ready for implementation, Refined; blocked by #X, or Needs PO decision
+- Existing issues found and included (with numbers)
+- Features created (if any) with issue numbers
+- Stories/Tasks created (if any) with issue numbers
+- Labels changed
+- Decision blockers raised (comment links), or none
+

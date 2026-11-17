@@ -1,0 +1,1897 @@
+"""Dispatcher hand-off to the Codex review loop and its two resume entries (issue #293).
+
+Drives the real ``scripts/dispatcher-invoke.sh`` with the fakes in
+``tests/dispatcher_fakes.py``. Each test asserts which sessions started, which
+board writes the dispatcher made and which comments it posted.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import textwrap
+
+import pytest
+
+from headless_pr_workflow import codex_review_bookkeeping as bookkeeping
+from tests.dispatcher_fakes import (
+    BASH, BOARD_OPTIONS, BOT, INVOKE, PO, REPO_ROOT, Dispatcher, bookkeeping_marker, needs_tools,
+    poll_fakes, scheduler_output,
+)
+from tests.hpw_dispatcher_route import fake_in_flight_route
+from tests.script_tools import script_path, windows_env
+
+STORY = 500
+PR = 900
+HEAD = "a" * 40
+NEW_HEAD = "b" * 40
+ROUTING_LIB = REPO_ROOT / "scripts" / "lib" / "review-routing.sh"  # review-path tables, shared with the poll (#315)
+CLAUDE_TIERS = ("claude-code-haiku", "claude-code-sonnet", "claude-code-opus")
+
+
+@pytest.fixture
+def d(tmp_path):
+    return Dispatcher(tmp_path)
+
+
+def owned(d: Dispatcher, head: str = HEAD, pr: int = PR) -> None:
+    """The head was pushed by the dispatcher's own /implement: it carries the merge-owner marker.
+
+    Without it, a clean review-loop head "In implementation" or "In review" gets
+    the missing-merge-owner blocker (issue #449 AC 4).
+    """
+    d.add_comment(pr, f"<!-- hpw:dispatcher action=merge-owner pr={pr} head={head} -->")
+
+
+def table(name: str) -> dict[str, str]:
+    """Rows of a ``declare -A`` table in dispatcher-invoke.sh."""
+    text = INVOKE.read_text(encoding="utf-8") + "\n" + ROUTING_LIB.read_text(encoding="utf-8")
+    block = re.search(rf"^declare -A {name}=\(\n(.*?)^\)$", text, re.MULTILINE | re.DOTALL)
+    assert block, f"{name} not found in {INVOKE} or {ROUTING_LIB}"
+    return dict(re.findall(r'^\s*\["([^"]+)"\]="([^"]*)"$', block.group(1), re.MULTILINE))
+
+
+def new_head_on_implement(d: Dispatcher, status: str | None = "In review") -> None:
+    """The /implement session pushes a commit and, like implement.md, sets the status."""
+    pulls = json.dumps([{"number": PR, "body": f"Closes #{STORY}", "state": "open", "draft": False,
+                         "merged_at": None, "updated_at": "2026-10-13T09:00:00Z",
+                         "head": {"ref": "branch", "sha": NEW_HEAD}}])
+    script = f"cat > \"$MOCK_DIR/pulls.json\" <<'EOF'\n{pulls}\nEOF\n"
+    if status:
+        script += (f"""jq '. + {{"ITEM_{STORY}": "{status}"}}' "$MOCK_DIR/state.json" > "$MOCK_DIR/s.tmp" """
+                   """&& mv "$MOCK_DIR/s.tmp" "$MOCK_DIR/state.json"\n""")
+    d.on_session("implement", script)
+
+
+def new_head_on_implement_once(d: Dispatcher) -> None:
+    """Only the first /implement session (the fix round) pushes a commit and sets "In review"."""
+    d.on_session("implement", f"""
+if [[ ! -f "$MOCK_DIR/fixed" ]]; then
+    touch "$MOCK_DIR/fixed"
+    jq 'map(if .number == {PR} then .head.sha = "{NEW_HEAD}" else . end)' "$MOCK_DIR/pulls.json" > "$MOCK_DIR/p.tmp" && mv "$MOCK_DIR/p.tmp" "$MOCK_DIR/pulls.json"
+    jq '. + {{"ITEM_{STORY}": "In review"}}' "$MOCK_DIR/state.json" > "$MOCK_DIR/s.tmp" && mv "$MOCK_DIR/s.tmp" "$MOCK_DIR/state.json"
+fi
+""")
+
+
+# ── Hand-off ────────────────────────────────────────────────────────────────
+
+
+@needs_tools
+@pytest.mark.parametrize("tier", CLAUDE_TIERS)
+def test_ac1_claude_story_is_handed_to_the_review_loop(d, tier):
+    d.add_story(STORY, "Ready to implement", executor=tier)
+    d.add_pr(PR, STORY)
+
+    proc = d.run_issue(STORY)
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert d.sessions == [f"implement {STORY}"]
+    assert d.board_writes == []
+    assert d.board_writes == []
+    assert d.posted(STORY) == [] and [b for b in d.posted(PR) if "action=merge-owner" not in b] == []
+    assert f"[HANDOFF] #{STORY}: handed to the Codex review loop (Codex Cloud) on PR #{PR};" in proc.stdout
+    assert d.usage_count == 1  # only the /implement session counts
+
+
+@needs_tools
+@pytest.mark.parametrize("with_pr", [True, False])
+def test_ac1_dry_run_names_the_hand_off(d, with_pr):
+    d.add_story(STORY, "Ready to implement")
+    if with_pr:
+        d.add_pr(PR, STORY)
+
+    proc = d.run_issue(STORY, "--dry-run")
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    on = f"PR #{PR}" if with_pr else "the PR /implement opens"
+    assert f"[DRY RUN] Would hand #{STORY} to the Codex review loop (Codex Cloud) on {on}: no /review session" in proc.stdout
+    assert "/review" not in proc.stdout.replace("no /review session", "")
+    assert d.sessions == [] and d.board_writes == [] and d.posted(STORY) == []
+
+
+@needs_tools
+@pytest.mark.parametrize("status_after_implement", ["In review", "Mergeable"])
+def test_ac2_no_write_when_the_story_already_moved_on(d, status_after_implement):
+    d.add_story(STORY, "Ready to implement")
+    d.add_pr(PR, STORY)
+    d.session_sets_status("implement", STORY, status_after_implement)
+
+    proc = d.run_issue(STORY)
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert d.board_writes == []  # the dispatcher writes no status (#478)
+    assert d.status(STORY) == status_after_implement
+    assert d.sessions == [f"implement {STORY}"]
+
+
+@needs_tools
+def test_ac2_no_write_while_a_fix_round_is_still_due(d):
+    """Findings are recorded for the head /implement left behind: "In review" is not written."""
+    d.add_story(STORY, "Ready to implement")
+    d.add_pr(PR, STORY)
+    # During the session: findings recorded before it would be a fix round for the resume pass (#475).
+    findings = json.dumps([{"user": {"login": BOT}, "created_at": "2026-10-13T10:59:00Z",
+                            "body": bookkeeping_marker("move-in-implementation", HEAD)}])
+    (d.mock / "comments_after.json").write_text(findings, encoding="utf-8", newline="\n")
+    d.on_session("implement", f'cp "$MOCK_DIR/comments_after.json" "$MOCK_DIR/comments_{PR}.json"\n')
+
+    proc = d.run_issue(STORY)
+
+    assert proc.returncode == 1
+    assert d.board_writes == []
+    assert len(d.posted(STORY)) == 1 and f"head={HEAD}" in d.posted(STORY)[0]
+
+
+@needs_tools
+@pytest.mark.parametrize("pr_before", [True, False])
+def test_ac2_findings_recorded_during_the_session_are_not_a_tried_fix_round(d, pr_before):
+    """Codex answers, and the bookkeeping job acts, before the /implement session returns."""
+    d.add_story(STORY, "Ready to implement")
+    if pr_before:
+        d.add_pr(PR, STORY)  # a story that already had a PR, at the old head
+    findings = json.dumps({"user": {"login": BOT}, "created_at": "2026-10-13T10:59:00Z",
+                           "body": bookkeeping_marker("move-in-implementation", NEW_HEAD)})
+    pulls = json.dumps([{"number": PR, "body": f"Closes #{STORY}", "state": "open", "draft": False,
+                         "merged_at": None, "updated_at": "2026-09-27T00:00:00Z",
+                         "head": {"ref": "branch", "sha": NEW_HEAD}}])
+    (d.mock / "pulls_after.json").write_text(pulls, encoding="utf-8", newline="\n")
+    (d.mock / "comments_after.json").write_text(f"[{findings}]", encoding="utf-8", newline="\n")
+    # First session: a new head, and findings recorded for it. Second session: the fix.
+    d.on_session("implement", f"""
+if [[ ! -f "$MOCK_DIR/implemented" ]]; then
+    touch "$MOCK_DIR/implemented"
+    cp "$MOCK_DIR/pulls_after.json" "$MOCK_DIR/pulls.json"
+    cp "$MOCK_DIR/comments_after.json" "$MOCK_DIR/comments_{PR}.json"
+else
+    jq 'map(.head.sha = "{"c" * 40}")' "$MOCK_DIR/pulls.json" > "$MOCK_DIR/p.tmp" && mv "$MOCK_DIR/p.tmp" "$MOCK_DIR/pulls.json"
+fi
+""")
+
+    proc = d.run_issue(STORY)
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert d.sessions == [f"implement {STORY}"]
+    assert d.board_writes == []
+    assert d.posted(STORY) == []
+    assert "the next run starts the fix round" in proc.stdout
+
+    # The next run starts the first fix round; it is not skipped as already tried.
+    again = d.resume()
+    assert again.returncode == 0, again.stdout + again.stderr
+    assert f"[RESUME] #{STORY}: fix round 1 of 3, /implement on PR #{PR}" in again.stdout
+    assert d.sessions == [f"implement {STORY}"] * 2
+    assert d.board_writes == []
+    assert d.posted(STORY) == []
+
+
+@needs_tools
+@pytest.mark.parametrize("head_changes", [False, True])
+def test_ac2_pending_hand_off_from_an_earlier_run_is_completed_once_without_a_write(d, head_changes):
+    """A hand-off-pending marker left before #478 (a failed "In review" write) gets its done marker once."""
+    d.add_story(STORY, "In implementation")
+    d.add_pr(PR, STORY, head=NEW_HEAD if head_changes else HEAD)
+    owned(d, NEW_HEAD if head_changes else HEAD)
+    d.add_comment(STORY, f"<!-- hpw:dispatcher action=hand-off-pending pr={PR} head={HEAD} -->")
+
+    first = d.resume()
+
+    assert first.returncode == 0, first.stdout + first.stderr
+    assert f"[RESUME] #{STORY}: completing the hand-off on PR #{PR}" in first.stdout
+    assert d.sessions == [] and d.board_writes == []
+    posted = d.posted(STORY)
+    assert len(posted) == 1 and f"action=hand-off-done pr={PR}" in posted[0]
+
+    # Completed once: a later run posts nothing more.
+    second = d.resume()
+    assert second.returncode == 0, second.stdout + second.stderr
+    assert "completing the hand-off" not in second.stdout
+    assert d.sessions == [] and d.board_writes == [] and len(d.posted(STORY)) == 1
+
+
+@needs_tools
+def test_a_handed_off_story_is_not_started_twice(d):
+    """No status write keeps the story from a second /implement: its non-draft PR does (#475, #478)."""
+    d.add_story(STORY, "Ready to implement")
+    d.add_pr(PR, STORY)
+
+    first = d.run_issue(STORY)
+
+    assert first.returncode == 0, first.stdout + first.stderr
+    assert f"[HANDOFF] #{STORY}" in first.stdout
+    assert d.sessions == [f"implement {STORY}"] and d.board_writes == []
+    assert d.posted(STORY) == []  # no hand-off-pending marker
+
+    later = d.resume()
+    assert later.returncode == 0, later.stdout + later.stderr
+    assert d.sessions == [f"implement {STORY}"] and d.board_writes == []
+
+
+@needs_tools
+def test_a_pending_hand_off_does_not_block_other_ready_stories(d):
+    """The pending story's hand-off is completed; another ready story still runs."""
+    d.add_story(700, "Ready to implement")
+    d.add_pr(970, 700)
+    d.add_story(STORY, "Ready to implement")
+    d.add_pr(PR, STORY)
+    d.add_comment(STORY, f"<!-- hpw:dispatcher action=hand-off-pending pr={PR} head={HEAD} -->")
+
+    proc = d.run_issue(700)
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert d.sessions == ["implement 700"]
+    assert d.board_writes == []
+
+
+@needs_tools
+def test_story_in_implementation_without_a_pending_hand_off_is_left_alone(d):
+    """A story someone is working on, with a ready PR, is not moved to "In review"."""
+    d.add_story(STORY, "In implementation")
+    d.add_pr(PR, STORY)
+    owned(d)
+    d.add_comment(STORY, f"<!-- hpw:dispatcher action=hand-off-pending pr=90 head={HEAD} -->")  # another PR
+    d.add_comment(STORY, f"<!-- hpw:dispatcher action=hand-off-pending pr={PR} head={HEAD} -->",
+                  login="someone-else")  # forged
+
+    proc = d.resume()
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert d.board_writes == [] and d.sessions == [] and d.posted(STORY) == []
+
+
+@needs_tools
+def test_forged_dispatcher_markers_are_ignored(d):
+    """Markers count only on comments by the dispatcher's own account."""
+    d.add_story(STORY, "In implementation")
+    d.add_pr(PR, STORY)
+    d.add_findings(PR, HEAD)
+    d.add_comment(STORY, f"<!-- hpw:dispatcher action=fix-round-attempt pr={PR} head={HEAD} -->", login="someone-else")
+    d.add_comment(STORY, f"<!-- hpw:dispatcher action=fix-round-max pr={PR} -->", login="someone-else")
+    d.add_story(600, "Mergeable")
+    d.add_pr(960, 600)
+    d.add_comment(600, f"<!-- hpw:dispatcher action=merge-attempt pr=960 head={HEAD} -->", login="someone-else")
+    new_head_on_implement_once(d)
+
+    proc = d.resume()
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert d.phases == ["merge 960", "cleanup 600"]
+    assert d.sessions == [f"implement {STORY}"]
+    assert "[RESUME SKIP]" not in proc.stdout
+
+
+@needs_tools
+def test_attempt_marker_is_superseded_by_a_later_findings_result_on_the_same_head(d):
+    """After a no-push round, a new findings result on the same head starts a round (issue #357)."""
+    d.add_story(STORY, "In implementation")
+    d.add_pr(PR, STORY)
+    d.add_findings(PR, HEAD)
+    d.add_comment(STORY, f"<!-- hpw:dispatcher action=fix-round-attempt pr={PR} head={HEAD} -->")
+    d.add_findings(PR, HEAD)
+    new_head_on_implement_once(d)
+
+    proc = d.resume()
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert d.sessions == [f"implement {STORY}"]
+    assert "[RESUME SKIP]" not in proc.stdout
+
+
+@needs_tools
+def test_forged_attempt_marker_cannot_hide_a_later_findings_result(d):
+    """A copied attempt marker from another account does not push the genuine one past a new findings result (issue #357)."""
+    d.add_story(STORY, "In implementation")
+    d.add_pr(PR, STORY)
+    d.add_findings(PR, HEAD)
+    d.add_comment(STORY, f"<!-- hpw:dispatcher action=fix-round-attempt pr={PR} head={HEAD} -->")
+    d.add_findings(PR, HEAD)
+    d.add_comment(STORY, f"<!-- hpw:dispatcher action=fix-round-attempt pr={PR} head={HEAD} -->", login="someone-else")
+    new_head_on_implement_once(d)
+
+    proc = d.resume()
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert d.sessions == [f"implement {STORY}"]
+    assert "[RESUME SKIP]" not in proc.stdout
+
+
+@needs_tools
+def test_dispatcher_markers_by_its_own_account_are_honoured(d):
+    """The same markers as above, written by the dispatcher: both stories are skipped."""
+    d.add_story(STORY, "In implementation")
+    d.add_pr(PR, STORY)
+    d.add_findings(PR, HEAD)
+    d.add_comment(STORY, f"<!-- hpw:dispatcher action=fix-round-attempt pr={PR} head={HEAD} -->")
+    d.add_story(600, "Mergeable")
+    d.add_pr(960, 600)
+    d.add_comment(600, f"<!-- hpw:dispatcher action=merge-attempt pr=960 head={HEAD} -->")
+
+    proc = d.resume()
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert d.sessions == [] and proc.stdout.count("[RESUME SKIP]") == 2
+
+
+@needs_tools
+@pytest.mark.parametrize("draft", [None, True])
+def test_ac3_no_open_pr_or_draft_pr_blocks_after_implement(d, draft):
+    d.add_story(STORY, "Ready to implement")
+    if draft:
+        d.add_pr(PR, STORY, draft=True)
+
+    proc = d.run_issue(STORY)
+
+    assert proc.returncode != 0
+    assert d.sessions == [f"implement {STORY}"]
+    assert d.board_writes == []
+    assert d.board_writes == []
+    blockers = d.posted(STORY)
+    assert len(blockers) == 1
+    assert "## Blocked Declaration" in blockers[0] and "/implement completes successfully" in blockers[0]
+    assert d.slack_calls == []
+
+
+CONFLICT_PHRASE = "merge conflict with main"
+UNBLOCK_PHRASE = "Unblocked when: the PR branch is merged with main and the conflict resolved"
+
+
+@needs_tools
+@pytest.mark.parametrize("extra", [
+    {"mergeable": False, "mergeable_state": "dirty"},
+    {"mergeable": None, "mergeable_state": "dirty"},
+    {"mergeable": False},
+])
+def test_381_conflicting_draft_pr_gets_the_conflict_blocker(d, extra):
+    d.add_story(STORY, "Ready to implement")
+    d.add_pr(PR, STORY, draft=True, **extra)
+
+    proc = d.run_issue(STORY)
+
+    assert proc.returncode != 0
+    assert "conflicts with main, so no CI run can start" in proc.stderr
+    blockers = d.posted(STORY)
+    assert len(blockers) == 1
+    assert "## Blocked Declaration" in blockers[0]
+    assert CONFLICT_PHRASE in blockers[0] and f"PR #{PR}" in blockers[0]
+    assert "no CI run" in blockers[0] and UNBLOCK_PHRASE in blockers[0]
+    assert "/implement completes successfully" not in blockers[0]
+    assert d.board_writes == []
+
+
+@needs_tools
+@pytest.mark.parametrize("extra", [
+    {"mergeable": True, "mergeable_state": "clean"},
+    {"mergeable": None, "mergeable_state": "unknown"},
+    {},
+])
+def test_381_clean_or_unknown_draft_pr_keeps_the_generic_blocker(d, extra):
+    d.add_story(STORY, "Ready to implement")
+    d.add_pr(PR, STORY, draft=True, **extra)
+
+    proc = d.run_issue(STORY)
+
+    assert proc.returncode != 0
+    assert "conflicts with main" not in proc.stderr
+    blockers = d.posted(STORY)
+    assert len(blockers) == 1
+    assert "/implement completes successfully" in blockers[0] and CONFLICT_PHRASE not in blockers[0]
+
+
+@needs_tools
+def test_381_unreadable_mergeability_keeps_the_generic_blocker_and_fails(d):
+    d.add_story(STORY, "Ready to implement")
+    d.add_pr(PR, STORY, draft=True, mergeable=False, mergeable_state="dirty")
+    d.fail_pr_read()
+
+    proc = d.run_issue(STORY)
+
+    assert proc.returncode != 0
+    blockers = d.posted(STORY)
+    assert len(blockers) == 1
+    assert "/implement completes successfully" in blockers[0] and CONFLICT_PHRASE not in blockers[0]
+
+
+@needs_tools
+def test_ac4_codex_story_in_review_is_reviewed_on_opus_then_merged(d):
+    d.add_story(STORY, "In review", executor="codex")
+    d.add_pr(PR, STORY, owned=True)
+    d.session_sets_status("review", STORY, "Mergeable")
+
+    proc = d.resume()
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert d.sessions == [f"review {PR}"]  # /merge and /cleanup start no session (#264)
+    assert d.phases == [f"merge {PR}", f"cleanup {STORY}"]
+    assert d.session_providers == ["review claude-code"]
+    assert d.board_writes == []
+    assert f"[RESUME] #{STORY}: /review on PR #{PR} under claude-code-opus" in proc.stdout
+    assert d.usage_count == 1  # the model session; /merge and /cleanup are scripts (#264)
+
+
+def test_ac5_review_path_tables():
+    paired = table("REVIEW_EXECUTOR_ROUTING")
+    loop = table("CODEX_REVIEW_LOOP_ROUTING")
+    assert paired == {"codex": "claude-code-opus"}
+    assert set(loop) == set(CLAUDE_TIERS)
+    for tier in CLAUDE_TIERS:
+        assert tier not in paired, f"{tier} is paired with a dispatcher /review session"
+    assert set(paired) | set(loop) == set(table("EXECUTOR_ROUTING"))
+    assert not set(paired) & set(loop)
+
+
+def test_ac5_executor_names_appear_only_in_tables():
+    """OSS invariant: no branch on an executor name outside the ``declare -A`` tables."""
+    text = INVOKE.read_text(encoding="utf-8")
+    code = re.sub(r"^declare -A \w+=\(\n.*?^\)$", "", text, flags=re.MULTILINE | re.DOTALL)
+    code = "\n".join(line for line in code.splitlines() if not line.lstrip().startswith("#"))
+    for name in table("EXECUTOR_ROUTING"):
+        assert f'"{name}"' not in code and f"'{name}'" not in code and f"== {name}" not in code, name
+
+
+@needs_tools
+def test_ac5_executor_with_no_review_path_gets_the_blocker(d, tmp_path, monkeypatch):
+    """A copy of the script with the loop row for one tier removed: that tier fails closed."""
+    scripts = tmp_path / "repo" / "scripts"
+    scripts.mkdir(parents=True)
+    (scripts / "dispatcher-invoke.sh").write_text(INVOKE.read_text(encoding="utf-8"), encoding="utf-8", newline="\n")
+    routing = ROUTING_LIB.read_text(encoding="utf-8")
+    row = '    ["claude-code-haiku"]="Codex Cloud"\n'
+    assert row in routing
+    (scripts / "dispatcher-usage-limit.sh").write_text(
+        (REPO_ROOT / "scripts" / "dispatcher-usage-limit.sh").read_text(encoding="utf-8"),
+        encoding="utf-8", newline="\n")
+    (scripts / "lib").mkdir()
+    for lib in ("claude-session.sh", "decision-blocker.sh", "evidence-pending.sh", "limits.sh",
+                "conflict-round.sh", "scheduler.sh", "in-flight.sh"):  # sourced (#314, #296, #348, #358, #449, #474, #475)
+        (scripts / "lib" / lib).write_text(
+            (REPO_ROOT / "scripts" / "lib" / lib).read_text(encoding="utf-8"),
+            encoding="utf-8", newline="\n")
+    (scripts / "lib" / "review-routing.sh").write_text(routing.replace(row, ""), encoding="utf-8", newline="\n")
+    commands = tmp_path / "repo" / ".claude" / "commands"
+    commands.mkdir(parents=True)
+    for name in ("implement", "review", "merge", "cleanup"):
+        (commands / f"{name}.md").write_text(
+            (REPO_ROOT / ".claude" / "commands" / f"{name}.md").read_text(encoding="utf-8"),
+            encoding="utf-8", newline="\n")
+    d.add_story(STORY, "Ready to implement", executor="claude-code-haiku")
+    d.add_pr(PR, STORY)
+
+    monkeypatch.setattr("tests.dispatcher_fakes.INVOKE", scripts / "dispatcher-invoke.sh")
+
+    proc = d.run_issue(STORY)
+
+    assert proc.returncode == 1
+    assert d.sessions == [f"implement {STORY}"]
+    assert "No review path for executor 'executor:claude-code-haiku'" in proc.stderr
+    assert len(d.posted(STORY)) == 1 and "/review completes successfully" in d.posted(STORY)[0]
+
+
+# ── Resume at "Mergeable" ────────────────────────────────────────────────────
+
+
+@needs_tools
+@pytest.mark.parametrize("executor", ["claude-code-sonnet", "codex"])
+def test_ac6_in_merge_story_with_open_pr_is_merged_and_cleaned_up(d, executor):
+    d.add_story(STORY, "Mergeable", executor=executor)
+    d.add_pr(PR, STORY)
+
+    proc = d.resume()
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert d.sessions == [] and d.claude_calls == []
+    assert d.phases == [f"merge {PR}", f"cleanup {STORY}"]
+    assert d.board_writes == []
+    assert d.posted(STORY) == []
+    assert f"[RESUME] #{STORY}: /merge PR #{PR}" in proc.stdout
+
+
+@needs_tools
+def test_ac7_in_merge_story_with_merged_pr_is_finished_without_merge(d):
+    d.add_story(STORY, "Mergeable")
+    d.add_pr(PR, STORY, state="closed", merged=True)
+
+    proc = d.resume()
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert d.sessions == []
+    assert d.phases == [f"cleanup {STORY}"]
+    assert d.board_writes == []
+    assert d.posted(STORY) == []
+
+
+@needs_tools
+@pytest.mark.parametrize("pr", ["none", "closed-unmerged", "draft"])
+def test_ac8_in_merge_story_without_a_pr_gets_no_blocker(d, pr):
+    """Issue #475 AC 3: the in-merge-without-pr blocker is retired; the card "Mergeable" decides nothing."""
+    d.add_story(STORY, "Mergeable")
+    if pr == "closed-unmerged":
+        d.add_pr(PR, STORY, state="closed")
+    elif pr == "draft":
+        d.add_pr(PR, STORY, draft=True)
+
+    first = d.resume()
+    second = d.resume()
+
+    assert first.returncode == 0 and second.returncode == 0, first.stderr + second.stderr
+    assert d.sessions == [] and d.board_writes == [] and d.phases == []
+    assert d.posted(STORY) == [] and d.posted(PR) == []
+    assert "in-merge-without-pr" not in first.stdout + second.stdout
+    assert f"[RESUME SKIP] #{STORY}:" not in first.stdout + second.stdout
+
+
+@needs_tools
+def test_ac9_one_merge_attempt_per_head(d):
+    d.add_story(STORY, "Mergeable")
+    d.add_pr(PR, STORY)
+    d.fail("merge")
+
+    first = d.resume()
+    assert first.returncode == 1
+    assert d.phases == [f"merge {PR}"]
+    blockers = d.posted(STORY)
+    assert len(blockers) == 1 and "/merge completes successfully" in blockers[0]
+    assert f"pr={PR} head={HEAD}" in blockers[0]
+    assert d.status(STORY) == "Mergeable"
+
+    # Same head: no session, no comment.
+    second = d.resume()
+    assert second.returncode == 0, second.stdout + second.stderr
+    assert d.phases == [f"merge {PR}"]
+    assert len(d.posted(STORY)) == 1
+    assert f"[RESUME SKIP] #{STORY}: /merge was already tried on PR #{PR}" in second.stdout
+
+    # A comment that only mentions unblocking, or an /unblock line by someone else, changes nothing.
+    d.add_comment(STORY, "please /unblock this", login=PO)
+    d.add_comment(STORY, "/unblock", login="someone-else")
+    assert d.resume().returncode == 0
+    assert d.phases == [f"merge {PR}"]
+
+    # A standalone /unblock line from the PO after the blocker: one more try.
+    d.add_comment(STORY, "Fixed the thread.\n/unblock", login=PO)
+    third = d.resume()
+    assert third.returncode == 1
+    assert d.phases == [f"merge {PR}"] * 2
+    assert len(d.posted(STORY)) == 2
+
+    # The new blocker is newer than the /unblock: skipped again.
+    assert d.resume().returncode == 0
+    assert d.phases == [f"merge {PR}"] * 2
+
+    # A new head: tried again, and this time it merges.
+    d.add_pr(PR, STORY, head=NEW_HEAD)
+    d.fail("merge", False)
+    fourth = d.resume()
+    assert fourth.returncode == 0, fourth.stdout + fourth.stderr
+    assert d.phases == [f"merge {PR}"] * 3 + [f"cleanup {STORY}"]
+    assert d.board_writes == []
+    assert len(d.posted(STORY)) == 2
+
+
+# ── Fix round ───────────────────────────────────────────────────────────────
+
+
+@needs_tools
+def test_ac10_fix_round_runs_implement_without_wip_or_overlap_checks(d):
+    files = "## Files affected\n\n- `scripts/a.sh`\n"
+    d.add_story(STORY, "In implementation", body=files)
+    d.add_story(501, "In implementation", executor="codex", body=files)  # WIP limit reached, same file
+    d.add_pr(PR + 1, 501, draft=True)  # its draft PR is the fact that holds the slot (#478)
+    d.add_pr(PR, STORY)
+    d.add_findings(PR, HEAD)
+    new_head_on_implement(d, status=None)  # the session pushes but skips the status write
+
+    proc = d.resume()
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert d.sessions == [f"implement {STORY}"]
+    assert f"[RESUME] #{STORY}: fix round 1 of 3, /implement on PR #{PR}" in proc.stdout
+    assert d.board_writes == []  # the dispatcher writes no status (#478)
+    assert d.posted(STORY) == [] and d.posted(501) == []
+    assert "WIP limit" not in proc.stdout and "File overlap" not in proc.stdout
+
+    # The new head has no marker: nothing more to resume.
+    again = d.resume()
+    assert again.returncode == 0 and d.sessions == [f"implement {STORY}"]
+
+
+@needs_tools
+def test_ac10_fix_round_leaves_in_review_written_by_the_session(d):
+    d.add_story(STORY, "In implementation")
+    d.add_pr(PR, STORY)
+    d.add_findings(PR, HEAD)
+    new_head_on_implement(d, status="In review")
+
+    proc = d.resume()
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert d.sessions == [f"implement {STORY}"]
+    assert d.board_writes == []
+    assert d.board_writes == []
+
+
+@needs_tools
+@pytest.mark.parametrize("case", ["no-marker", "older-head", "other-account", "no-open-pr",
+                                  "executor-not-on-loop", "two-executor-labels", "other-action"])
+def test_ac11_no_fix_round(d, case):
+    executor = "codex" if case == "executor-not-on-loop" else "claude-code-sonnet"
+    labels = ["type:story", "executor:claude-code-sonnet", "executor:claude-code-opus"] \
+        if case == "two-executor-labels" else None
+    d.add_story(STORY, "In implementation", executor=executor, labels=labels)
+    if case != "no-open-pr":
+        # A codex story's ready PR would be in the review step (#475): its PR is still a draft.
+        d.add_pr(PR, STORY, draft=case == "executor-not-on-loop")
+        owned(d)
+    if case == "older-head":
+        d.add_findings(PR, "c" * 40)
+    elif case == "other-account":
+        d.add_findings(PR, HEAD, login="someone-else")
+    elif case == "other-action":
+        d.add_comment(PR, bookkeeping.action_marker(bookkeeping.ACTION_MOVE_IN_MERGE, HEAD))
+    elif case != "no-marker":
+        d.add_findings(PR, HEAD)
+
+    proc = d.resume()
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert d.sessions == [] and d.board_writes == []
+    assert d.posted(STORY) == [] and [b for b in d.posted(PR) if "action=merge-owner" not in b] == []
+
+
+@needs_tools
+def test_ac12_fix_round_maximum(d):
+    d.add_story(STORY, "In implementation")
+    d.add_pr(PR, STORY)
+    for head in ("1" * 40, "2" * 40, HEAD):
+        d.add_findings(PR, head)
+    d.add_findings(PR, HEAD)  # a second marker for the same head counts once
+
+    # Three heads, maximum two: no session, one resource blocker, posted once.
+    first = d.resume(env={"CODEX_FIX_ROUND_MAX": "2"})
+    second = d.resume(env={"CODEX_FIX_ROUND_MAX": "2"})
+    assert first.returncode == 0 and second.returncode == 0, first.stderr + second.stderr
+    assert d.sessions == [] and d.board_writes == []
+    blockers = d.posted(STORY)
+    assert len(blockers) == 1 and "## Blocked Declaration\nType: resource\n" in blockers[0]
+    assert f"[RESUME SKIP] #{STORY}: fix round 3 on PR #{PR} is above the maximum of 2" in second.stdout
+
+    # The default maximum is three: the third round runs.
+    new_head_on_implement(d)
+    third = d.resume(env={"CODEX_FIX_ROUND_MAX": ""})
+    assert third.returncode == 0, third.stdout + third.stderr
+    assert f"[RESUME] #{STORY}: fix round 3 of 3, /implement on PR #{PR}" in third.stdout
+    assert d.sessions == [f"implement {STORY}"]
+
+
+@needs_tools
+@pytest.mark.parametrize("value", ["0", "-1", "abc", "2.5", "3x"])
+def test_ac12_invalid_maximum_stops_the_run(d, value):
+    d.add_story(STORY, "In implementation")
+    d.add_pr(PR, STORY)
+    d.add_findings(PR, HEAD)
+
+    proc = d.resume(env={"CODEX_FIX_ROUND_MAX": value})
+
+    assert proc.returncode != 0
+    assert "CODEX_FIX_ROUND_MAX must be a whole number of one or more" in proc.stderr and value in proc.stderr
+    assert d.sessions == [] and d.posted(STORY) == [] and d.board_writes == []
+
+
+@needs_tools
+@pytest.mark.parametrize("seq,returncode,line", [("1", 0, "[RESERVE SKIP]"), ("2", 1, "[ALLOWANCE ERROR]")])
+def test_fix_round_keeps_its_place_when_the_allowance_check_stops_it(d, seq, returncode, line):
+    """A fix round is unfinished work: it is not put back to "Ready to implement"."""
+    d.add_story(700, "Ready to implement")
+    d.add_pr(970, 700)
+    d.add_story(STORY, "In implementation")
+    d.add_pr(PR, STORY)
+    d.add_findings(PR, HEAD)
+
+    first = d.run_issue(700, seq=seq)
+    second = d.run_issue(700, seq=seq)
+
+    for proc in (first, second):
+        assert proc.returncode == returncode, proc.stdout + proc.stderr
+        assert f"{line} #{STORY}:" in proc.stdout + proc.stderr
+    assert d.sessions == [] and d.board_writes == []
+    assert d.status(STORY) == "In implementation" and d.status(700) == "Ready to implement"
+    assert d.posted(STORY) == [] and d.posted(700) == [] and d.slack_calls == []
+
+    # With allowance back, the fix round runs before the ready story.
+    new_head_on_implement_once(d)
+    third = d.run_issue(700)
+    assert third.returncode == 0, third.stdout + third.stderr
+    assert d.sessions == [f"implement {STORY}", "implement 700"]
+    assert d.board_writes == []
+
+
+@needs_tools
+@pytest.mark.parametrize("status_after_session", ["In review", "Mergeable", None])
+def test_fix_round_that_pushes_nothing_is_recorded_whatever_the_status(d, status_after_session):
+    """The session moved the story on without a commit; the bookkeeping job would move it back."""
+    d.add_story(STORY, "In implementation")
+    d.add_pr(PR, STORY)
+    owned(d)
+    d.add_findings(PR, HEAD)
+    if status_after_session:
+        d.session_sets_status("implement", STORY, status_after_session)
+
+    first = d.resume()
+
+    assert first.returncode == 1
+    assert d.sessions == [f"implement {STORY}"]
+    assert d.board_writes == []
+    blockers = d.posted(STORY)
+    assert len(blockers) == 1 and "/implement completes successfully" in blockers[0]
+    assert f"action=fix-round-attempt pr={PR} head={HEAD}" in blockers[0]
+
+    # The bookkeeping job sees the findings for the same head and moves the story back.
+    d.set_status(STORY, "In implementation")
+    second = d.resume()
+    assert second.returncode == 0, second.stdout + second.stderr
+    assert d.sessions == [f"implement {STORY}"]  # the same round does not start again
+    assert len(d.posted(STORY)) == 1
+    assert f"[RESUME SKIP] #{STORY}: the fix round was already tried on PR #{PR}" in second.stdout
+
+
+@needs_tools
+def test_fix_round_that_fails_is_not_repeated_on_the_same_head(d):
+    d.add_story(STORY, "In implementation")
+    d.add_pr(PR, STORY)
+    owned(d)
+    d.add_findings(PR, HEAD)
+    d.fail("implement")
+
+    first = d.resume()
+    second = d.resume()
+
+    assert first.returncode == 1 and second.returncode == 0
+    assert d.sessions == [f"implement {STORY}"]
+    assert len(d.posted(STORY)) == 1
+    assert f"[RESUME SKIP] #{STORY}: the fix round was already tried on PR #{PR}" in second.stdout
+
+
+@needs_tools
+def test_story_held_by_the_fix_round_maximum_gets_no_session_and_no_write(d):
+    """The fix-round maximum blocker holds the story; no stale rollback restarts it (issue #478)."""
+    d.add_story(700, "Ready to implement")
+    d.add_pr(970, 700)
+    d.add_story(STORY, "In implementation")
+    d.add_pr(PR, STORY)
+    owned(d)
+    for head in ("1" * 40, HEAD):
+        d.add_findings(PR, head)
+
+    proc = d.run_issue(700, env={"CODEX_FIX_ROUND_MAX": "1"})
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    comments = d.posted(STORY)
+    assert d.sessions == ["implement 700"]
+    assert d.board_writes == []
+    assert len(comments) == 1 and "Type: resource" in comments[0]
+    assert "STALE:" not in proc.stdout
+
+
+def test_ac10_implement_command_skips_the_wip_preflight_for_a_story_already_in_implementation():
+    """The fix-round session runs implement.md: the prompt itself must not stop on WIP or file overlap."""
+    text = (REPO_ROOT / ".claude" / "commands" / "implement.md").read_text(encoding="utf-8")
+    step = re.search(r"^7\. Run the WIP pre-flight check.*?(?=^8\. )", text, re.MULTILINE | re.DOTALL)
+    assert step
+    bullets = re.findall(r"^   - (.+)$", step.group(0), re.MULTILINE)
+    skip = bullets[0]  # stated before the stop conditions
+    assert skip.startswith('skip this check when the story is already "In implementation" and has an open PR linked to it')
+    assert "steps 10 and 17" in skip
+    assert any(b.startswith("stop if 2 or more stories") for b in bullets[1:])
+    assert any(b.startswith("stop if any active story declares overlapping files") for b in bullets[1:])
+    # The canonical rule in docs/PROJECT-STATUS.md covers only the start of a ready story (issue #479 renamed the statuses).
+    policy = (REPO_ROOT / "docs" / "PROJECT-STATUS.md").read_text(encoding="utf-8")
+    assert "Before a story that shows **Ready to implement** starts (its first draft PR)" in policy
+
+
+# ── Order and entry ─────────────────────────────────────────────────────────
+
+
+@needs_tools
+def test_ac13_in_merge_then_fix_round_then_ready_story(d):
+    d.add_story(700, "Ready to implement")
+    d.add_pr(970, 700)
+    d.add_story(STORY, "In implementation")
+    d.add_pr(PR, STORY)
+    d.add_findings(PR, HEAD)
+    d.add_story(600, "Mergeable")
+    d.add_pr(960, 600)
+    new_head_on_implement_once(d)
+
+    proc = d.run_issue(700)
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert d.phases == ["merge 960", "cleanup 600"]
+    assert d.sessions == [f"implement {STORY}", "implement 700"]
+    assert d.board_writes == []
+
+
+@needs_tools
+def test_feature_closure_is_notified_when_its_last_two_stories_finish_in_one_resume_pass(d):
+    feature = "Feature group: #50 Feature: something"
+    d.add_story(600, "Mergeable", body=feature)
+    d.add_pr(960, 600)
+    d.add_story(601, "Mergeable", body=feature)
+    d.add_pr(961, 601)
+    d.add_story(602, "Done", body=feature)
+
+    proc = d.resume()
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert d.phases == ["merge 960", "cleanup 600", "merge 961", "cleanup 601"]
+    assert proc.stdout.count("Feature #50: all 3 stories Done.") == 1
+    # Issue #349: the drain after the last resume item delivers the event in the run.
+    assert len(d.slack_calls) == 1
+    assert [(e["event"], e["issue"], e["delivered"]) for e in d.queued_events] == [
+        ("feature_closure_confirmation", 50, True)]
+
+
+def _closure_then_other_feature(d):
+    d.add_story(600, "Mergeable", body="Feature group: #50 Feature: a")
+    d.add_pr(960, 600)
+    d.add_story(602, "Done", body="Feature group: #50 Feature: a")
+    d.add_story(601, "Mergeable", body="Feature group: #51 Feature: b")
+    d.add_pr(961, 601)
+    d.add_story(603, "Ready for refinement", body="Feature group: #51 Feature: b")
+
+
+@needs_tools
+def test_event_is_delivered_before_the_next_resume_item_starts(d):
+    _closure_then_other_feature(d)
+
+    proc = d.resume()
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert d.sequence == ["merge 960", "cleanup 600", "slack", "merge 961", "cleanup 601"]
+    assert [(e["event"], e["delivered"]) for e in d.queued_events] == [
+        ("feature_closure_confirmation", True)]
+
+
+@needs_tools
+def test_event_is_delivered_before_the_requested_implement_session(d):
+    d.add_story(600, "Mergeable", body="Feature group: #50 Feature: a")
+    d.add_pr(960, 600)
+    d.add_story(602, "Done", body="Feature group: #50 Feature: a")
+    d.add_story(700, "Ready to implement")
+    d.add_pr(970, 700)
+
+    proc = d.run_issue(700)
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    seq = d.sequence
+    assert "slack" in seq and "session implement 700" in seq, seq
+    assert seq.index("slack") < seq.index("session implement 700")
+
+
+@needs_tools
+def test_failed_drain_between_resume_items_does_not_stop_the_pass(d):
+    _closure_then_other_feature(d)
+    (d.mock / "fail_slack").write_text("")
+
+    proc = d.resume()
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert d.phases == ["merge 960", "cleanup 600", "merge 961", "cleanup 601"]
+    events = d.queued_events
+    assert [(e["event"], e["delivered"]) for e in events] == [("feature_closure_confirmation", False)]
+    assert not events[0].get("failed_cycles")
+
+
+@needs_tools
+def test_dry_run_drain_between_resume_items_sends_nothing(d):
+    _closure_then_other_feature(d)
+
+    proc = d.resume("--dry-run")
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert d.slack_calls == []
+
+
+@needs_tools
+def test_feature_closure_is_not_notified_while_a_story_is_still_open(d):
+    feature = "Feature group: #50 Feature: something"
+    d.add_story(600, "Mergeable", body=feature)
+    d.add_pr(960, 600)
+    d.add_story(601, "In review", body=feature)
+
+    proc = d.resume()
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert d.phases == ["merge 960", "cleanup 600"]
+    assert "all 2 stories Done" not in proc.stdout and d.slack_calls == []
+
+
+def poll_json(tmp_path, items: list[tuple], pulls: list[dict] | None = None, evidence: str = "[]",
+              scheduler: tuple = ("idle",), dry_run: bool = True, raw_scheduler: str | None = None,
+              stderr: list | None = None, gates: dict[int, str] | None = None,
+              comments: dict[int, list] | None = None) -> dict:
+    """Run the real dispatcher-poll.sh against a fake ``curl`` that serves the open issues and PRs.
+
+    An item is ``(number, status)`` or ``(number, status, [labels])``. The poll finds work in flight
+    from PR facts (issue #475), so the status is not served: it only names the card the test moved.
+    ``pulls`` is the open-PR list, ``gates`` the merge gates of a PR (``pass``; default ``fail``) and
+    ``comments`` the comments of an issue or PR. A fake ``hpw`` answers ``hpw dispatcher scheduler
+    next`` with ``scheduler`` (the arguments of ``scheduler_output``) or the text ``raw_scheduler``,
+    and logs its arguments to ``scheduler.log``; it answers ``dispatcher marker whoami`` with the
+    dispatcher's account; any other ``hpw`` call runs the real one. The fake ``curl`` logs Slack
+    calls to ``slack.log``. ``stderr``, when given, receives the poll's stderr.
+    """
+    board = {"data": {"repository": {"projectsV2": {"nodes": [{
+        "number": 3, "title": "board",
+        "items": {"pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}}]}}}}
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fakes = poll_fakes(tmp_path, bin_dir, [(n, rest[0] if rest else []) for n, _status, *rest in items],
+                       gates=gates, comments=comments)
+    comment_dir = tmp_path / "comments"
+    comment_dir.mkdir()
+    for number, rows in (comments or {}).items():
+        (comment_dir / f"{number}.json").write_text(json.dumps(rows), encoding="utf-8")
+    (tmp_path / "board.json").write_text(json.dumps(board), encoding="utf-8")
+    curl = bin_dir / "curl"
+    (tmp_path / "pulls.json").write_text(json.dumps(pulls or []), encoding="utf-8")
+    curl.write_text('#!/usr/bin/env bash\nurl="${@: -1}"\ncase "$*" in\n  *hooks.slack*) echo "$*" >> "$SLACK_LOG" ;;\n'
+                    '  */comments*) n="${url%/comments*}"; n="${n##*/}"; f="$COMMENT_DIR/$n.json"\n'
+                    '      if [[ "$url" == *page=1 && -f "$f" ]]; then cat "$f"; else echo "[]"; fi ;;\n'
+                    '  */pulls/[0-9]*) n="${url##*/}"; jq --argjson n "$n" \'.[] | select(.number == $n)\' "$PULLS_FILE" ;;\n'
+                    '  *state=closed*) echo "[]" ;;\n'
+                    '  */pulls*) cat "$PULLS_FILE" ;;\n'
+                    '  *labels=evidence*) [ "$EVIDENCE" = fail ] && exit 22; echo "$EVIDENCE" ;;\n'
+                    '  *"/issues?state=open"*) cat "$ISSUES_FILE" ;;\n  *) cat "$BOARD_FILE" ;;\nesac\n',
+                    encoding="utf-8", newline="\n")
+    curl.chmod(0o755)
+    result, issue, error, skipped = (*scheduler, *(None, None, "", None)[len(scheduler):])
+    out, err, rc = scheduler_output(result, issue, error=error, skipped=skipped)
+    (tmp_path / "scheduler.json").write_text(out if raw_scheduler is None else raw_scheduler, encoding="utf-8")
+    (tmp_path / "scheduler.err").write_text(err, encoding="utf-8")
+    hpw = bin_dir / "hpw"
+    hpw.write_text('#!/usr/bin/env bash\n' + fake_in_flight_route()
+                   + 'if [[ "${1:-} ${2:-} ${3:-}" == "dispatcher scheduler next" ]]; then\n'
+                   f'    echo "$*" >> "{(tmp_path / "scheduler.log").as_posix()}"\n'
+                   f'    cat "{(tmp_path / "scheduler.err").as_posix()}" >&2\n'
+                   f'    cat "{(tmp_path / "scheduler.json").as_posix()}"\n'
+                   f'    exit {rc}\nfi\n'
+                   'if [[ "${1:-} ${2:-} ${3:-}" == "dispatcher marker whoami" ]]; then\n'
+                   f'    echo \'{{"result": "read", "dispatcher": "{BOT}", "bookkeeping": "{BOT}"}}\'; exit 0\nfi\n'
+                   f'exec "{(REPO_ROOT / "scripts" / "hpw").as_posix()}" "$@"\n', encoding="utf-8", newline="\n")
+    hpw.chmod(0o755)
+    (tmp_path / "slack.log").write_text("")
+    env = {"PATH": script_path(bin_dir.as_posix()), "GH_TOKEN": "fake", "HOME": tmp_path.as_posix(),
+           "BOARD_FILE": (tmp_path / "board.json").as_posix(),
+           "PULLS_FILE": (tmp_path / "pulls.json").as_posix(), "EVIDENCE": evidence,
+           "COMMENT_DIR": comment_dir.as_posix(),
+           "SLACK_LOG": (tmp_path / "slack.log").as_posix(),
+           "SLACK_WEBHOOK_URL": "https://hooks.slack.test/T000/B000",
+           "DISPATCHER_STATE_DIR": (tmp_path / "state").as_posix(),
+           "HPW_BIN": hpw.as_posix(), **fakes,
+           "WIP_LIMIT_IMPLEMENTATION": "2", "READY_BUFFER_MIN": "3", "READY_BUFFER_MAX": "5", **windows_env()}
+    args = ["--dry-run"] if dry_run else []
+    proc = subprocess.run(
+        [BASH, (REPO_ROOT / "scripts" / "dispatcher-poll.sh").as_posix(), "--repo", "o/r", *args],
+        env=env, capture_output=True, text=True, encoding="utf-8", timeout=120)
+    assert proc.returncode == 0, proc.stderr
+    if stderr is not None:
+        stderr.append(proc.stderr)
+    return json.loads(proc.stdout)
+
+
+def poll_pr(number: int, issue: int, head: str = HEAD, draft: bool = False) -> dict:
+    """An open PR as the poll reads it, with a head."""
+    return {"number": number, "draft": draft, "body": f"Closes #{issue}", "state": "open",
+            "head": {"sha": head}, "mergeable": True, "mergeable_state": "clean"}
+
+
+def poll_findings(head: str = HEAD) -> dict:
+    """The bookkeeping job's findings on ``head``, as the poll reads the PR's comments."""
+    return {"user": {"login": BOT}, "author_association": "COLLABORATOR", "created_at": "2026-10-13T10:00:00Z",
+            "body": "## Session Summary\nCommand: review\n\n" + bookkeeping_marker("move-in-implementation", head)}
+
+
+@needs_tools
+def test_ac14_poll_lists_in_merge_and_in_implementation(tmp_path):
+    """#475 AC 7: in_merge and in_implementation come from PR facts; each card shows another status."""
+    out = poll_json(tmp_path, [(1, "Ready to implement"), (2, "Ready for refinement"),
+                               (3, "In review", ["executor:codex"]),
+                               (4, "In review", ["executor:claude-code-sonnet"]),
+                               (5, "Mergeable", ["executor:codex"]), (6, "Done"),
+                               (7, "In implementation", ["executor:codex"])],
+                    pulls=[poll_pr(13, 3), poll_pr(14, 4), poll_pr(15, 5), poll_pr(17, 7, draft=True)],
+                    gates={13: "pass"}, comments={14: [poll_findings()]},
+                    scheduler=("implement", 1))
+    assert out == {
+        "in_merge": [{"number": 3, "title": "Story 3"}],
+        "in_implementation": [{"number": 4, "title": "Story 4"}],
+        "review_due": [{"number": 5, "title": "Story 5"}],
+        "conflict_due": [],
+        "owner_missing_due": [],
+        "evidence_pending": False,
+        "next_issue": 1,
+        "next_action": {"kind": "implement", "issue": 1, "type": "story", "epic": 306, "step": 1, "reason": "test"},
+        "scheduler_result": "implement",
+        "resumable": True,
+    }
+    # #475 AC 8: a draft PR or a fix round due counts for the WIP limit; the other open PRs are in flight.
+    assert (tmp_path / "scheduler.log").read_text().splitlines() == [
+        "dispatcher scheduler next --repo o/r --in-implementation 4,7 --in-flight 3,5 --dry-run"]
+
+
+@needs_tools
+@pytest.mark.parametrize("status", ["Mergeable", "In review", "In implementation", "Ready to implement"])
+def test_475_ac6_a_moved_card_without_a_pr_is_in_no_poll_key(tmp_path, status):
+    """#475 AC 6: a story with no linked PR and no dispatcher marker is in no key, whatever its card says."""
+    out = poll_json(tmp_path, [(8, status, ["executor:codex"]), (9, status, ["executor:claude-code-sonnet"])])
+    for key in ("in_merge", "in_implementation", "review_due", "conflict_due", "owner_missing_due"):
+        assert out[key] == [], key
+    assert out["resumable"] is False
+    assert (tmp_path / "scheduler.log").read_text().splitlines() == [
+        "dispatcher scheduler next --repo o/r --in-implementation  --in-flight  --dry-run"]
+
+
+@needs_tools
+def test_475_ac8_poll_lists_a_story_with_an_open_dependency_blocker_as_in_flight(tmp_path):
+    """#475 AC 8: an open non-decision blocker without a later /unblock keeps the story in flight."""
+    blocker = {"user": {"login": BOT}, "author_association": "COLLABORATOR", "created_at": "2026-10-13T10:00:00Z",
+               "body": "## Blocked Declaration\nType: external\nDeclared by: dispatcher"}
+    decision = dict(blocker, body="## Blocked Declaration\nType: decision\nDeclared by: dispatcher")
+    lifted = {"user": {"login": PO}, "author_association": "OWNER", "created_at": "2026-10-13T11:00:00Z",
+              "body": "/unblock"}
+    out = poll_json(tmp_path, [(11, "Ready to implement"), (12, "Ready to implement"),
+                               (13, "Ready to implement")],
+                    comments={11: [blocker], 12: [decision], 13: [blocker, lifted]})
+    assert out["resumable"] is False
+    assert (tmp_path / "scheduler.log").read_text().splitlines() == [
+        "dispatcher scheduler next --repo o/r --in-implementation  --in-flight 11 --dry-run"]
+
+
+# ── Issue #474: the poll asks the scheduler (AC 1, 5, 8, 9, 10) ─────────────
+
+
+@needs_tools
+@pytest.mark.parametrize("scheduler,result,issue", [
+    (("refine", 2), "refine", 2),
+    (("implement", 1), "implement", 1),
+    (("idle",), "idle", None),
+    (("unreadable", None, "facts: down"), "unreadable", None),
+])
+def test_474_poll_json_shape_for_each_scheduler_result(tmp_path, scheduler, result, issue):
+    out = poll_json(tmp_path, [(1, "Ready to implement"), (2, "Ready for refinement")], scheduler=scheduler)
+    assert set(out) == {"in_merge", "in_implementation", "review_due", "conflict_due", "owner_missing_due",
+                        "evidence_pending", "next_issue", "next_action", "scheduler_result", "resumable"}
+    assert out["scheduler_result"] == result and out["next_issue"] == issue
+    assert (out["next_action"] or {}).get("issue") == issue
+    assert out["resumable"] is False  # nothing in flight
+
+
+@needs_tools
+def test_474_poll_output_that_cannot_be_read_is_unreadable(tmp_path):
+    err: list = []
+    out = poll_json(tmp_path, [(1, "Ready to implement")], raw_scheduler="oops", scheduler=("unreadable", None, "x"),
+                    stderr=err)
+    assert out["scheduler_result"] == "unreadable" and out["next_issue"] is None and out["next_action"] is None
+    assert "[SCHEDULER] unreadable: hpw dispatcher scheduler next exited 3 without a result" in err[0]
+
+
+@needs_tools
+@pytest.mark.parametrize("scheduler,line", [
+    (("idle", None, "", [{"issue": 306, "reason": "no-merged-spec: no spec on main"}]),
+     "[SCHEDULER] skip #306 no-merged-spec: no spec on main"),
+    (("idle",), "[SCHEDULER] idle"),
+    (("unreadable", None, "facts: down"), "[SCHEDULER] unreadable: facts: down"),
+])
+def test_474_poll_passes_the_scheduler_lines_to_the_run_log(tmp_path, scheduler, line):
+    err: list = []
+    poll_json(tmp_path, [(1, "Ready for refinement")], scheduler=scheduler, stderr=err)
+    assert line in err[0]
+
+
+@needs_tools
+def test_474_a_ready_for_refinement_issue_gets_no_notification_and_no_state(tmp_path):
+    out = poll_json(tmp_path, [(301, "Ready for refinement"), (302, "Ready for refinement")], dry_run=False)
+    assert out["scheduler_result"] == "idle"
+    assert (tmp_path / "slack.log").read_text() == ""
+    assert not (tmp_path / "state").exists() or not any((tmp_path / "state").rglob("*"))
+
+
+def test_474_no_code_path_sends_or_stores_the_retired_notification():
+    for path in [*(REPO_ROOT / "scripts").rglob("*.sh"), *(REPO_ROOT / "scripts").glob("hpw*"),
+                 *(REPO_ROOT / "src").rglob("*.py"), REPO_ROOT / ".github" / "workflows" / "dispatcher.yml"]:
+        text = path.read_text(encoding="utf-8")
+        assert "ready_for_refinement" not in text, path
+        assert "notified-refinement" not in text, path
+
+
+def open_pr(number: int, issue: int, draft: bool = False) -> dict:
+    return {"number": number, "draft": draft, "body": f"Closes #{issue}"}
+
+
+@needs_tools
+def test_ac15_poll_lists_review_due_for_the_codex_story_only(tmp_path):
+    out = poll_json(
+        tmp_path,
+        [(1, "In review", ["executor:codex"]), (2, "In review", ["executor:claude-code-sonnet"]),
+         (3, "In review", ["executor:codex", "executor:claude-code-opus"]),
+         (4, "In review", ["executor:codex"]), (5, "In review", ["executor:codex"]),
+         (6, "In review", [])],
+        pulls=[open_pr(11, 1), open_pr(12, 2), open_pr(13, 3), open_pr(15, 5, draft=True)],
+    )
+    # 2 is Claude-tier (Codex Cloud reviews it), 3 has two labels, 4 has no PR, 5 has a draft PR, 6 has no label
+    assert out["review_due"] == [{"number": 1, "title": "Story 1"}]
+
+
+@needs_tools
+def test_ac16_only_claude_tier_in_review_gives_an_empty_review_due(tmp_path):
+    out = poll_json(tmp_path, [(2, "In review", ["executor:claude-code-sonnet"])], pulls=[open_pr(12, 2)])
+    assert out["review_due"] == []
+
+
+@needs_tools
+def test_ac14_poll_lists_are_empty_arrays_when_nothing_matches(tmp_path):
+    out = poll_json(tmp_path, [(5, "In review")])  # no linked PR
+    assert out["in_merge"] == [] and out["in_implementation"] == [] and out["review_due"] == []
+    assert "ready_for_implementation" not in out and "ready_for_refinement" not in out
+
+
+@needs_tools
+@pytest.mark.parametrize("missing", ["In review", "Mergeable"])
+def test_ac15_a_missing_board_option_does_not_stop_the_run(tmp_path, missing):
+    """Issue #478: the startup option check is gone; the dispatcher writes no status and needs no option."""
+    options = {name: value for name, value in BOARD_OPTIONS.items() if name != missing}
+    d = Dispatcher(tmp_path, options=options)
+    d.add_story(STORY, "Ready to implement")
+    d.add_pr(PR, STORY)
+
+    proc = d.run_issue(STORY)
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Status option" not in proc.stderr
+    assert d.sessions == [f"implement {STORY}"] and d.board_writes == []
+
+
+@needs_tools
+def test_ac15_allowance_never_holds_the_script_only_merge_at_a_resume_entry(d):
+    d.add_story(STORY, "Mergeable")
+    d.add_pr(PR, STORY)
+
+    proc = d.resume(seq="1")  # a refusing allowance is never consulted for /merge or /cleanup (#264)
+
+    assert proc.returncode == 0, proc.stderr
+    assert d.allowance_calls == 0 and d.sessions == []
+    assert d.phases == [f"merge {PR}", f"cleanup {STORY}"]
+    assert d.board_writes == [] and d.posted(STORY) == []
+
+
+# ── Contracts with the bookkeeping job and the workflow ─────────────────────
+
+
+def test_fix_round_marker_matches_the_bookkeeping_job():
+    text = INVOKE.read_text(encoding="utf-8")
+    declared = re.search(r'^\s*BOOKKEEPING_FIX_MARKER="(.*)"$', text, re.MULTILINE)
+    assert declared
+    marker = bookkeeping.action_marker(bookkeeping.ACTION_MOVE_IN_IMPLEMENTATION, HEAD)
+    assert marker.startswith(declared.group(1) + HEAD + " ")
+    with_source = bookkeeping.action_marker(bookkeeping.ACTION_MOVE_IN_IMPLEMENTATION, HEAD, source="x")
+    assert with_source.startswith(declared.group(1) + HEAD + " ")
+
+
+def test_invoke_script_never_writes_the_review_trigger_or_the_legacy_status():
+    from headless_pr_workflow.review_policy import CODEX_REVIEW_TRIGGER_PHRASE
+
+    text = INVOKE.read_text(encoding="utf-8")
+    assert CODEX_REVIEW_TRIGGER_PHRASE not in text
+    assert "Ready to merge" not in text
+
+
+WORKFLOW = REPO_ROOT / ".github" / "workflows" / "dispatcher.yml"
+WORK_CONDITION = ("steps.guard.outputs.enabled == 'true' && "
+                  "(steps.poll.outputs.issue_number != '' || steps.poll.outputs.resumable == 'true' "
+                  "|| inputs.refine_issue != '')")  # issue #319: a manual refinement run
+
+
+def workflow_step(name: str) -> str:
+    text = WORKFLOW.read_text(encoding="utf-8")
+    matches = list(re.finditer(r"^      - name: (.+)$", text, re.MULTILINE))
+    for i, match in enumerate(matches):
+        if match.group(1).strip() == name:
+            return text[match.start(): matches[i + 1].start() if i + 1 < len(matches) else len(text)]
+    raise AssertionError(f"step {name!r} not found in {WORKFLOW}")
+
+
+@pytest.mark.parametrize("name,prefix", [("Restore session state cache", ""), ("Install Claude Code", ""),
+                                         ("Run dispatcher invoke", ""),
+                                         ("Save session state cache", "always() && ")])
+def test_ac14_workflow_steps_run_on_resumable_work(name, prefix):
+    condition = re.search(r"^        if: (.+)$", workflow_step(name), re.MULTILINE)
+    assert condition and condition.group(1).strip() == prefix + WORK_CONDITION
+
+
+def test_ac14_workflow_poll_step_reports_resumable_work():
+    assert "bash scripts/dispatcher-workflow-step.sh poll" in workflow_step("Run dispatcher poll")
+    script = (REPO_ROOT / "scripts" / "dispatcher-workflow-step.sh").read_text(encoding="utf-8")
+    assert 'echo "resumable=$resumable" >> "$GITHUB_OUTPUT"' in script
+    assert 'echo "issue_number=$next" >> "$GITHUB_OUTPUT"' in script
+
+
+@needs_tools
+@pytest.mark.parametrize("items,pulls,gates,comments,key", [
+    ([(3, "Ready to implement", ["executor:codex"])], [poll_pr(13, 3)], {13: "pass"}, None, "in_merge"),
+    ([(4, "In review", ["executor:claude-code-sonnet"])], [poll_pr(14, 4)], None, {14: [poll_findings()]},
+     "in_implementation"),
+    ([(5, "Mergeable", ["executor:codex"])], [open_pr(15, 5)], None, None, "review_due"),
+])
+def test_ac14_poll_is_resumable_for_each_resumable_list(tmp_path, items, pulls, gates, comments, key):
+    """The RESUMABLE rule of issue #293, now in the poll (issue #434), from PR facts (#475 AC 7);
+    conflict_due and owner_missing_due are covered in test_dispatcher_conflict_round.py."""
+    out = poll_json(tmp_path, items, pulls=pulls, gates=gates, comments=comments)
+    assert out[key] and out["resumable"] is True and out["evidence_pending"] is False
+
+
+@needs_tools
+def test_ac14_poll_is_not_resumable_with_nothing_to_resume(tmp_path):
+    out = poll_json(tmp_path, [(1, "Ready to implement"), (2, "Ready for refinement"), (6, "Done")],
+                    scheduler=("implement", 1))
+    assert out["resumable"] is False and out["next_issue"] == 1
+
+
+@needs_tools
+@pytest.mark.parametrize("evidence,expected", [
+    ('[{"number": 9}]', True),   # a Done story carries evidence:pending
+    ("[]", False),               # nothing to retry
+    ("fail", True),              # the label could not be read: the retry is not skipped
+    ("not json", True),          # an unreadable answer counts as pending too
+    ('{"message": "Bad credentials"}', True),
+])
+def test_348_poll_resumes_for_a_story_labelled_evidence_pending(tmp_path, evidence, expected):
+    out = poll_json(tmp_path, [], evidence=evidence)
+    assert out["evidence_pending"] is expected and out["resumable"] is expected
+
+
+def test_ac14_workflow_invoke_step_resumes_without_a_ready_story():
+    body = workflow_step("Run dispatcher invoke")
+    env_block, run_block = body.split("        run:", 1)
+    assert "CODEX_FIX_ROUND_MAX: ${{ vars.CODEX_FIX_ROUND_MAX }}" in env_block
+    # Issue #474: the invoke step asks the scheduler itself; the poll's choice is not passed on.
+    assert "NEXT_ISSUE" not in env_block
+    assert run_block.strip().splitlines()[0] == "bash scripts/dispatcher-workflow-step.sh invoke"
+
+
+# ── Docs (AC16) ─────────────────────────────────────────────────────────────
+
+
+def section(path: str, heading: str) -> str:
+    text = (REPO_ROOT / path).read_text(encoding="utf-8")
+    level = heading.split(" ", 1)[0]
+    match = re.search(rf"^{re.escape(heading)}$\n(.*?)(?=^#{{1,{len(level)}}} |\Z)", text, re.MULTILINE | re.DOTALL)
+    assert match, f"{heading!r} not found in {path}"
+    return match.group(1)
+
+
+def test_ac16_adapters_describes_the_review_loop():
+    pairing = section("docs/ADAPTERS.md", "### Cross-Provider Review Pairing")
+    for needle in ("Codex review loop", "ADR-006", "**Merge step.**", "fix round", "CODEX_FIX_ROUND_MAX",
+                   "one `/merge` attempt per PR head"):
+        assert needle in pairing, needle
+    for tier in CLAUDE_TIERS:
+        row = re.search(rf"^\| `executor:{tier}` \| (.+) \|$", pairing, re.MULTILINE)
+        assert row and "Codex Cloud" in row.group(1) and "no dispatcher session" in row.group(1)
+    assert "Ready to merge" not in (REPO_ROOT / "docs" / "ADAPTERS.md").read_text(encoding="utf-8")
+
+
+def test_ac16_dispatcher_config_describes_hand_off_and_resume():
+    text = (REPO_ROOT / "docs" / "DISPATCHER-CONFIG.md").read_text(encoding="utf-8")
+    assert "Ready to merge" not in text
+    flow = section("docs/DISPATCHER-CONFIG.md", "## Codex review loop hand-off and resume")
+    for needle in ("### Hand-off after `/implement`", "### The merge step", "### Fix round",
+                   "### Order", "`CODEX_FIX_ROUND_MAX`", "One merge attempt per head",
+                   "`--resume`", "[RESUME SKIP]", "`in_merge`", "`in_implementation`"):
+        assert needle in flow, needle
+    review_table = section("docs/DISPATCHER-CONFIG.md", "### Review path (issues #263 and #293)")
+    for tier in CLAUDE_TIERS:
+        assert re.search(rf"^\| `{tier}` \| Codex review loop", review_table, re.MULTILINE), tier
+    assert re.search(r"^\| `codex` \| `/review` session under `claude-code-opus`", review_table, re.MULTILINE)
+
+
+# ── Retryable merge and cleanup evidence (issue #348) ───────────────────────
+
+OWNER_MARKER = f"<!-- hpw:dispatcher action=merge-owner pr={PR} head={HEAD} -->"
+CONFIRMATION = "Merge gate: policy=pass, head=aaaaaaa\n\n## Session Summary\nCommand: merge"
+CLOSING = "## Session Summary\nCommand: cleanup\nNext action: done"
+
+
+def pending(item: str, payload: str, head: str = "-") -> str:
+    """The evidence-pending comment, built by the library the writers use."""
+    return subprocess.run(
+        [BASH, "-c", f'source "{REPO_ROOT}/scripts/lib/evidence-pending.sh"; evidence_pending_comment "$@"',
+         "_", item, head, payload], capture_output=True, text=True, check=True).stdout
+
+
+def count_of(d: Dispatcher, target: int, text: str) -> int:
+    return len([b for b in d.posted(target) if text in b])
+
+
+@needs_tools
+def test_348_owner_marker_and_pending_copy_both_failing_stops_before_the_hand_off(d):
+    """No durable record exists: the run fails loudly and the story does not advance to review."""
+    d.add_story(STORY, "Ready to implement")
+    d.add_pr(PR, STORY)
+    new_head_on_implement(d)
+    d.fail_comment_writes(PR, 6)  # three marker attempts and three pending attempts
+
+    proc = d.run_issue(STORY)
+
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "could not record merge ownership or its pending copy" in proc.stderr
+    assert d.posted(PR) == [] and d.posted(STORY) == []  # no hand-off was recorded
+
+
+@needs_tools
+def test_348_ac1_failed_owner_marker_write_is_left_pending_for_the_head_the_session_produced(d):
+    d.add_story(STORY, "Ready to implement")
+    d.add_pr(PR, STORY)
+    new_head_on_implement(d)
+    d.fail_comment_writes(PR, 3)  # the three marker attempts fail, the pending comment works
+
+    proc = d.run_issue(STORY)
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert d.board_writes == []
+    comments = d.posted(PR)
+    assert len(comments) == 1 and f"action=evidence-pending item=merge-owner head={NEW_HEAD} " in comments[0]
+    assert OWNER_MARKER.replace(HEAD, NEW_HEAD) not in comments[0]  # the marker itself is not posted yet
+
+
+@needs_tools
+def test_348_ac1_pending_owner_marker_is_posted_for_the_current_head_before_the_merge(d):
+    d.add_story(STORY, "Mergeable")
+    d.add_pr(PR, STORY, owned=False)
+    d.add_comment(PR, pending("merge-owner", OWNER_MARKER, HEAD))
+
+    proc = d.resume()
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert d.posted(PR) == [OWNER_MARKER]
+    assert d.phases == [f"merge {PR}", f"cleanup {STORY}"]
+
+    # Idempotent: the marker is on the PR now, so a retry posts nothing more.
+    d.set_status(STORY, "Mergeable")
+    d.add_pr(PR, STORY, owned=False)
+    assert d.resume().returncode == 0
+    assert d.posted(PR) == [OWNER_MARKER]
+
+
+@needs_tools
+def test_348_ac1_pending_owner_marker_for_another_head_is_never_posted(d):
+    d.add_story(STORY, "Mergeable")
+    d.add_pr(PR, STORY, head=NEW_HEAD)  # the head moved on after the session
+    d.add_comment(PR, pending("merge-owner", OWNER_MARKER, HEAD))
+
+    proc = d.resume()
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert d.posted(PR) == []
+    assert f"[RESUME SKIP] #{STORY}: the merge-owner evidence on #{PR} is for head aaaaaaa, not bbbbbbb" in proc.stdout
+
+
+@needs_tools
+def test_348_ac5_pending_comments_of_another_account_are_ignored(d):
+    d.add_story(STORY, "Mergeable")
+    d.add_pr(PR, STORY)
+    d.add_comment(PR, pending("merge-owner", OWNER_MARKER, HEAD), login="someone-else")
+
+    assert d.resume().returncode == 0
+    assert d.posted(PR) == []
+
+
+@needs_tools
+def test_348_ac2_pending_merge_confirmation_is_posted_once_before_cleanup(d):
+    d.add_story(STORY, "Mergeable")
+    d.add_pr(PR, STORY, state="closed", merged=True)
+    d.add_comment(PR, pending("merge-confirmation", CONFIRMATION, HEAD))
+
+    proc = d.resume()
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert d.posted(PR) == [CONFIRMATION]
+    assert d.phases == [f"cleanup {STORY}"]
+    assert d.board_writes == []
+
+    # A second retry finds the confirmation and posts nothing.
+    d.set_status(STORY, "Mergeable")
+    assert d.resume().returncode == 0
+    assert d.posted(PR) == [CONFIRMATION]
+
+
+@needs_tools
+def test_348_ac4_confirmation_that_is_already_posted_is_not_posted_again(d):
+    d.add_story(STORY, "Mergeable")
+    d.add_pr(PR, STORY, state="closed", merged=True)
+    d.add_comment(PR, pending("merge-confirmation", CONFIRMATION, HEAD))
+    d.add_comment(PR, CONFIRMATION)  # the first write succeeded although it looked failed
+
+    assert d.resume().returncode == 0
+    assert d.posted(PR) == []
+    assert d.phases == [f"cleanup {STORY}"]
+
+
+@needs_tools
+def test_348_ac2_confirmation_written_by_another_account_is_not_proof(d):
+    d.add_story(STORY, "Mergeable")
+    d.add_pr(PR, STORY, state="closed", merged=True)
+    d.add_comment(PR, pending("merge-confirmation", CONFIRMATION, HEAD))
+    d.add_comment(PR, CONFIRMATION, login="someone-else")
+
+    assert d.resume().returncode == 0
+    assert d.posted(PR) == [CONFIRMATION]
+
+
+@needs_tools
+def test_348_ac2_merge_script_failing_after_a_completed_merge_is_not_a_merge_blocker(d):
+    """The script merged, then failed to post the confirmation: the PR is merged and the script exits 1."""
+    d.add_story(STORY, "Mergeable")
+    d.add_pr(PR, STORY)
+    d.fail("merge")
+    d.on_session("merge", """jq 'map(.state = "closed" | .merged_at = "2026-10-13T09:30:00Z")' "$MOCK_DIR/pulls.json" > "$MOCK_DIR/p.tmp" && mv "$MOCK_DIR/p.tmp" "$MOCK_DIR/pulls.json"\n""")
+    d.add_comment(PR, OWNER_MARKER)
+    d.add_comment(PR, pending("merge-confirmation", CONFIRMATION, HEAD))
+
+    proc = d.resume()
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert not any("Blocked Declaration" in b for b in d.posted(STORY))
+    assert d.posted(PR) == [CONFIRMATION]
+    assert d.phases == [f"merge {PR}", f"cleanup {STORY}"] and d.board_writes == []
+    assert "its confirmation comment was not posted; retried on a later run" in proc.stdout
+
+
+@needs_tools
+def test_348_merge_script_failing_after_a_merge_without_pending_evidence_still_blocks(d):
+    """A failure that left no pending confirmation (e.g. summary generation) must not be treated as retryable."""
+    d.add_story(STORY, "Mergeable")
+    d.add_pr(PR, STORY)
+    d.fail("merge")
+    d.on_session("merge", """jq 'map(.state = "closed" | .merged_at = "2026-10-13T09:30:00Z")' "$MOCK_DIR/pulls.json" > "$MOCK_DIR/p.tmp" && mv "$MOCK_DIR/p.tmp" "$MOCK_DIR/pulls.json"\n""")
+    d.add_comment(PR, OWNER_MARKER)
+
+    proc = d.resume()
+
+    assert any("Blocked Declaration" in b for b in d.posted(STORY)), proc.stdout + proc.stderr
+    assert d.phases == [f"merge {PR}"] and d.status(STORY) != "Done"
+
+
+LABELLED = ["type:story", "executor:claude-code-sonnet", "evidence:pending"]
+
+
+def labels_of(d: Dispatcher, number: int) -> list[str]:
+    return [label["name"] for label in d._read(f"issue_{number}.json")["labels"]]
+
+
+def leave_pending_cleanup_summary(d: Dispatcher) -> None:
+    """The cleanup script could not post the closing summary and left its pending copy on the story."""
+    (d.mock / "pending_body").write_text(pending("cleanup-summary", CLOSING), encoding="utf-8", newline="\n")
+    d.on_session("cleanup", f"""f="$MOCK_DIR/comments_{STORY}.json"; [[ -f "$f" ]] || echo '[]' > "$f"
+jq --arg u "$MOCK_BOT" --rawfile b "$MOCK_DIR/pending_body" '. + [{{user: {{login: $u}}, body: $b, created_at: "2026-10-13T11:00:00Z"}}]' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+""")
+
+
+@needs_tools
+def test_348_ac3_pending_cleanup_summary_is_posted_once_on_a_done_story(d):
+    d.add_story(STORY, "Done", labels=LABELLED)
+    d.add_comment(STORY, pending("cleanup-summary", CLOSING))
+
+    proc = d.resume()
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert d.posted(STORY) == [CLOSING]
+    assert d.phases == [] and d.sessions == []
+
+    assert "evidence:pending" not in labels_of(d, STORY)
+
+    assert d.resume().returncode == 0
+    assert d.posted(STORY) == [CLOSING]  # nothing posted twice
+
+
+@needs_tools
+def test_348_ac3_pending_cleanup_summary_is_recovered_however_old_it_is(d):
+    """No dispatcher run for months after /cleanup left the pending copy: the label still leads back to it."""
+    d.add_story(STORY, "Done", labels=LABELLED)
+    d._write(f"comments_{STORY}.json", [{"user": {"login": BOT}, "created_at": "2026-01-02T00:00:00Z",
+                                          "body": pending("cleanup-summary", CLOSING)}])
+
+    proc = d.resume()
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert d.posted(STORY) == [CLOSING]
+    assert "evidence:pending" not in labels_of(d, STORY)
+
+
+@needs_tools
+def test_348_ac3_pending_cleanup_summary_of_another_account_is_ignored(d):
+    d.add_story(STORY, "Done", labels=LABELLED)
+    d.add_comment(STORY, pending("cleanup-summary", CLOSING), login="someone-else")
+
+    assert d.resume().returncode == 0
+    assert d.posted(STORY) == []
+    assert "evidence:pending" not in labels_of(d, STORY)  # nothing of the dispatcher's own is pending
+
+
+@needs_tools
+@pytest.mark.parametrize("label_exists", [False, True])  # GitHub answers 404 when adding a label the repo lacks
+def test_348_ac3_cleanup_that_left_the_pending_copy_labels_the_done_story_for_a_later_run(d, label_exists):
+    d.add_story(STORY, "Mergeable")
+    d.add_pr(PR, STORY, state="closed", merged=True)
+    if label_exists:
+        (d.mock / "repo_labels").write_text("evidence:pending\n", encoding="utf-8", newline="\n")
+    leave_pending_cleanup_summary(d)
+    d.fail("cleanup")
+
+    proc = d.resume()
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert d.board_writes == [] and "evidence:pending" in labels_of(d, STORY)
+    assert (d.mock / "repo_labels").read_text(encoding="utf-8").splitlines() == ["evidence:pending"]
+    assert d.posted(STORY) == []
+
+    d.fail("cleanup", False)
+    (d.mock / "on_cleanup.sh").unlink()
+    d.close_issue(STORY)  # the merged PR closed it; only the evidence:pending label leads back (#475)
+    proc = d.resume()
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert d.posted(STORY) == [CLOSING]
+    assert d.phases == [f"cleanup {STORY}"]  # the story is Done: cleanup is not run again
+    assert "evidence:pending" not in labels_of(d, STORY)
+
+
+@needs_tools
+def test_348_ac3_pending_copy_without_the_label_goes_back_to_in_merge(d):
+    """The label write failed too: nothing would lead a later run back to the Done story."""
+    d.add_story(STORY, "Mergeable")
+    d.add_pr(PR, STORY, state="closed", merged=True)
+    leave_pending_cleanup_summary(d)
+    d.fail("cleanup")
+    (d.mock / "fail_labels").write_text("")
+
+    proc = d.resume()
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert d.status(STORY) == "Mergeable"
+    assert "evidence:pending" not in labels_of(d, STORY)
+
+
+@needs_tools
+def test_348_ac6_ac7_a_write_that_keeps_failing_gives_up_after_three_runs_with_one_blocker(d):
+    d.add_story(STORY, "Mergeable")
+    d.add_pr(PR, STORY, state="closed", merged=True)
+    d.add_comment(PR, pending("merge-confirmation", CONFIRMATION, HEAD))
+    d.fail_comment_writes(PR, 1000)
+
+    for run in (1, 2):
+        proc = d.resume()
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert d.status(STORY) == "Mergeable" and d.phases == []  # cleanup waits for the evidence
+        assert len(d.slack_calls) == 0 and not any("Blocked Declaration" in b for b in d.posted(STORY))
+    assert count_of(d, STORY, "action=evidence-retry-failed") == 2
+
+    third = d.resume()
+    assert third.returncode == 0, third.stdout + third.stderr
+    blockers = [b for b in d.posted(STORY) if "## Blocked Declaration" in b]
+    assert len(blockers) == 1 and "Type: external" in blockers[0]
+    # One retried message (#359); the drain after the resume item delivers it in the run (#349).
+    assert len(d.slack_calls) == 1 and [(e["event"], e["delivered"]) for e in d.queued_events] == [("po_blocker", True)]
+
+    # Retrying has stopped: no further write attempt, no second blocker, no second Slack message.
+    writes = len([line for line in (d.mock / "gh.log").read_text().splitlines() if f"issues/{PR}/comments" in line and "POST" in line])
+    queued = len(d.queued_events)
+    fourth = d.resume()
+    assert fourth.returncode == 0, fourth.stdout + fourth.stderr
+    assert len([b for b in d.posted(STORY) if "## Blocked Declaration" in b]) == 1
+    assert len(d.queued_events) == queued
+    assert "retrying stopped after 3 runs" in fourth.stdout
+    assert writes == len([line for line in (d.mock / "gh.log").read_text().splitlines() if f"issues/{PR}/comments" in line and "POST" in line])
+
+
+# ── Decision blocker: alert, no-push round, Codex reviewer (issue #357) ─────
+
+DECLARATION = ("## Blocked Declaration\nType: decision\nQuestion: waive the listed findings for this PR?\n"
+               "Options:\nA) waive\nB) fix here\nRecommendation: A\n")
+
+
+def session_declares_blocker(d: Dispatcher, command: str, issue: int = STORY, push: bool = False) -> None:
+    """The ``command`` session leaves a decision blocker on the story (and, with ``push``, a new head)."""
+    body = json.dumps(DECLARATION)
+    script = (f"""jq --argjson b '{body}' '. + [{{user: {{login: "{BOT}"}}, author_association: "COLLABORATOR", created_at: "2026-10-13T12:00:00Z", body: $b}}]' """
+              f""""$MOCK_DIR/comments_{issue}.json" > "$MOCK_DIR/c.tmp" && mv "$MOCK_DIR/c.tmp" "$MOCK_DIR/comments_{issue}.json"\n""")
+    if push:
+        new_head_on_implement(d, status="In review")
+        script = (d.mock / f"on_{command}.sh").read_text(encoding="utf-8") + script
+    d.on_session(command, script)
+
+
+def session_requests_review(d: Dispatcher, pr: int = PR, login: str = BOT) -> None:
+    """The ``/implement`` session posts the post-waiver review request on the PR (pushing nothing)."""
+    from headless_pr_workflow.review_policy import CODEX_REVIEW_TRIGGER_PHRASE
+
+    body = json.dumps(CODEX_REVIEW_TRIGGER_PHRASE + "\n")
+    d.on_session("implement", f"""jq --argjson b '{body}' '. + [{{user: {{login: "{login}"}}, author_association: "COLLABORATOR", created_at: "2026-10-13T12:00:00Z", body: $b}}]' """
+                 f""""$MOCK_DIR/comments_{pr}.json" > "$MOCK_DIR/c.tmp" && mv "$MOCK_DIR/c.tmp" "$MOCK_DIR/comments_{pr}.json"\n""")
+
+
+def decision_events(d: Dispatcher) -> list[dict]:
+    return [e for e in d.queued_events if e["event"] == "decision_blocker"]
+
+
+@needs_tools
+def test_357_first_implement_that_exits_0_with_a_decision_blocker_registers_one_event(d):
+    d.add_story(STORY, "Ready to implement")
+    d.add_pr(PR, STORY)
+    session_declares_blocker(d, "implement", push=True)
+
+    proc = d.run_issue(STORY)
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert [(e["issue"], e["delivered"]) for e in decision_events(d)] == [(STORY, False)]
+
+
+@needs_tools
+def test_357_first_implement_without_a_decision_blocker_registers_nothing(d):
+    d.add_story(STORY, "Ready to implement")
+    d.add_pr(PR, STORY)
+    new_head_on_implement(d, status="In review")
+
+    proc = d.run_issue(STORY)
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert decision_events(d) == []
+
+
+@needs_tools
+def test_357_fix_round_that_exits_0_with_a_decision_blocker_registers_one_event(d):
+    d.add_story(STORY, "In implementation")
+    d.add_pr(PR, STORY)
+    d.add_findings(PR, HEAD)
+    session_declares_blocker(d, "implement", push=True)
+
+    proc = d.resume()
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert [e["issue"] for e in decision_events(d)] == [STORY]
+
+
+@needs_tools
+def test_357_lifted_blocker_is_not_announced_again(d):
+    d.add_story(STORY, "In implementation")
+    d.add_pr(PR, STORY)
+    d.add_comment(STORY, DECLARATION)
+    d.add_comment(STORY, "Waived.\n/unblock\n", login=PO)
+    d.add_findings(PR, HEAD)
+    new_head_on_implement(d, status="In review")
+
+    proc = d.resume()
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert decision_events(d) == []
+
+
+@needs_tools
+def test_357_review_that_exits_0_with_a_decision_blocker_registers_one_event_and_never_a_second(d):
+    d.add_story(STORY, "In review", executor="codex")
+    d.add_pr(PR, STORY)
+    session_declares_blocker(d, "review")
+
+    first = d.resume()
+
+    assert first.returncode == 0, first.stdout + first.stderr
+    assert d.phases == []  # the story stays "In review": no merge
+    assert [e["issue"] for e in decision_events(d)] == [STORY]
+
+    # Forget the reviewed-head record so /review runs again over the same declaration.
+    kept = [c for c in json.loads((d.mock / f"comments_{STORY}.json").read_text()) if "Blocked Declaration" in c["body"]]
+    (d.mock / f"comments_{STORY}.json").write_text(json.dumps(kept))
+    second = d.resume()
+
+    assert second.returncode == 0, second.stdout + second.stderr
+    assert d.sessions == [f"review {PR}", f"review {PR}"]
+    assert len(decision_events(d)) == 1
+
+
+@needs_tools
+def test_357_review_without_a_decision_blocker_registers_nothing(d):
+    d.add_story(STORY, "In review", executor="codex")
+    d.add_pr(PR, STORY)
+
+    assert d.resume().returncode == 0
+    assert decision_events(d) == []
+
+
+@needs_tools
+def test_357_only_out_of_scope_round_is_not_a_failure_and_is_not_repeated(d):
+    d.add_story(STORY, "In implementation")
+    d.add_pr(PR, STORY)
+    d.add_findings(PR, HEAD)
+    session_declares_blocker(d, "implement")  # exits 0, pushes nothing
+
+    first = d.resume()
+
+    assert first.returncode == 0, first.stdout + first.stderr
+    assert d.sessions == [f"implement {STORY}"]
+    posted = d.posted(STORY)
+    assert not any("Type: external" in body for body in posted)
+    assert "pushed no new commit" not in first.stderr
+    assert any(f"action=fix-round-attempt pr={PR} head={HEAD}" in body for body in posted)
+    assert d.status(STORY) == "In implementation" and d.board_writes == []
+    assert [e["issue"] for e in decision_events(d)] == [STORY]
+
+    second = d.resume()
+
+    assert second.returncode == 0, second.stdout + second.stderr
+    assert d.sessions == [f"implement {STORY}"]  # no second /implement on the same head
+
+
+@needs_tools
+def test_357_post_waiver_round_that_pushes_nothing_reaches_review(d):
+    d.add_story(STORY, "In implementation")
+    d.add_pr(PR, STORY)
+    d.add_findings(PR, HEAD)
+    d.add_comment(STORY, DECLARATION)
+    d.add_comment(STORY, "Waived F1 (#400).\n/unblock\n", login=PO)
+    session_requests_review(d)
+
+    proc = d.resume()
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert d.sessions == [f"implement {STORY}"]
+    assert not any("Type: external" in body for body in d.posted(STORY))
+    assert any(f"action=fix-round-attempt pr={PR} head={HEAD}" in body for body in d.posted(STORY))
+    assert d.board_writes == []
+    assert d.posted(PR) == []  # the one review request is the session's; the dispatcher posts none
+
+    again = d.resume()
+    assert again.returncode == 0 and d.sessions == [f"implement {STORY}"]
+
+
+@needs_tools
+def test_357_post_waiver_round_without_a_fresh_review_request_is_a_failure(d):
+    # The request that produced the waived findings predates the /unblock; the
+    # session pushes nothing and posts no new request, so the head's latest
+    # review event stays the waived findings result.
+    from headless_pr_workflow.review_policy import CODEX_REVIEW_TRIGGER_PHRASE
+
+    d.add_story(STORY, "In implementation")
+    d.add_pr(PR, STORY)
+    d.add_comment(PR, CODEX_REVIEW_TRIGGER_PHRASE + "\n")
+    d.add_findings(PR, HEAD)
+    d.add_comment(STORY, DECLARATION)
+    d.add_comment(STORY, "Waived F1 (#400).\n/unblock\n", login=PO)
+    d.add_comment(PR, "Thanks, " + CODEX_REVIEW_TRIGGER_PHRASE + " later.\n")  # not a request: phrase not first
+
+    proc = d.resume()
+
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "posted no review request" in proc.stderr
+    blockers = [b for b in d.posted(STORY) if "Type: external" in b]
+    assert len(blockers) == 1 and "posted no review request" in blockers[0]
+    assert f"action=fix-round-attempt pr={PR} head={HEAD}" in blockers[0]
+    assert not any("without a new commit" in body for body in d.posted(STORY))
+    assert d.board_writes == []
+
+    again = d.resume()
+    assert d.sessions == [f"implement {STORY}"], again.stdout + again.stderr  # no second round on the head
+
+
+@needs_tools
+def test_357_post_waiver_review_request_by_a_bot_does_not_end_the_round(d):
+    d.add_story(STORY, "In implementation")
+    d.add_pr(PR, STORY)
+    d.add_findings(PR, HEAD)
+    d.add_comment(STORY, DECLARATION)
+    d.add_comment(STORY, "Waived F1 (#400).\n/unblock\n", login=PO)
+    session_requests_review(d)
+    script = (d.mock / "on_implement.sh").read_text(encoding="utf-8")
+    d.on_session("implement", script.replace("user: {login:", 'user: {type: "Bot", login:'))
+
+    proc = d.resume()
+
+    assert proc.returncode == 1 and "posted no review request" in proc.stderr
+
+
+@needs_tools
+def test_357_consumed_waiver_does_not_excuse_a_later_unrelated_no_push_round(d):
+    d.add_story(STORY, "In implementation")
+    d.add_pr(PR, STORY)
+    d.add_findings(PR, HEAD)
+    d.add_comment(STORY, DECLARATION)
+    d.add_comment(STORY, "Waived F1 (#400).\n/unblock\n", login=PO)
+    d.add_findings(PR, HEAD)  # a later, unrelated findings result after the waiver
+
+    proc = d.resume()
+
+    assert proc.returncode == 1 and "pushed no new commit" in proc.stderr
+    assert not any("without a new commit" in body for body in d.posted(STORY))
+
+
+@needs_tools
+def test_357_no_push_without_a_decision_blocker_is_still_a_failure(d):
+    d.add_story(STORY, "In implementation")
+    d.add_pr(PR, STORY)
+    d.add_findings(PR, HEAD)
+    d.add_comment(STORY, "Blocked Declaration is only mentioned in prose, /unblock too.\n")
+
+    proc = d.resume()
+
+    assert proc.returncode == 1
+    assert "pushed no new commit" in proc.stderr
+    assert len([b for b in d.posted(STORY) if "/implement completes successfully" in b]) == 1
+
+
+@needs_tools
+def test_357_blocker_declared_before_the_session_and_still_open_does_not_excuse_a_missing_push(d):
+    d.add_story(STORY, "In implementation")
+    d.add_pr(PR, STORY)
+    d.add_findings(PR, HEAD)
+    d.add_comment(STORY, DECLARATION)  # an earlier declaration the session did not make
+
+    proc = d.resume()
+
+    assert proc.returncode == 1 and "pushed no new commit" in proc.stderr
+
+
+@needs_tools
+def test_357_declaration_forged_by_an_outsider_does_not_excuse_a_missing_push(d):
+    d.add_story(STORY, "In implementation")
+    d.add_pr(PR, STORY)
+    d.add_findings(PR, HEAD)
+    comments = d._read(f"comments_{STORY}.json", [])
+    comments.append({"user": {"login": "stranger"}, "author_association": "NONE", "body": DECLARATION,
+                     "created_at": "2026-10-13T12:00:00Z"})
+    d._write(f"comments_{STORY}.json", comments)
+
+    proc = d.resume()
+
+    assert proc.returncode == 1 and "pushed no new commit" in proc.stderr
+
+
+@needs_tools
+def test_357_codex_review_that_leaves_the_story_in_review_runs_no_merge_and_unblock_reviews_again(d):
+    d.add_story(STORY, "In review", executor="codex")
+    d.add_pr(PR, STORY, owned=True)
+
+    first = d.resume()  # /review exits 0 and leaves the story "In review" (a COMMENT review)
+
+    assert first.returncode == 0, first.stdout + first.stderr
+    assert d.sessions == [f"review {PR}"] and d.phases == []
+    assert any(f"action=review-attempt pr={PR} head={HEAD}" in body for body in d.posted(STORY))
+
+    skipped = d.resume()
+    assert d.sessions == [f"review {PR}"] and "/review was already tried" in skipped.stdout
+
+    d.add_comment(STORY, "Waived.\n/unblock\n", login=PO)
+    d.session_sets_status("review", STORY, "Mergeable")
+    third = d.resume()
+
+    assert third.returncode == 0, third.stdout + third.stderr
+    assert d.sessions == [f"review {PR}", f"review {PR}"]  # the same head is reviewed again
+    assert d.phases == [f"merge {PR}", f"cleanup {STORY}"]

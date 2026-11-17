@@ -1,0 +1,199 @@
+# Agent Guidance
+
+This file defines project-level assistant guidance for work in this repository. It is advisory assistant behavior, not normative workflow policy.
+
+## GitHub Operations
+
+When working in this repository from Codex or a similar sandboxed assistant environment:
+
+- Use the GitHub plugin/MCP integration for GitHub operations when it is available.
+- If the GitHub plugin/MCP integration is not available in the current session, use the authenticated `gh` CLI for required GitHub reads and mutations.
+- Use direct GitHub API calls such as `curl` only when neither the plugin/MCP integration nor `gh` supports the required operation.
+- Never expose, print, log, persist, or commit GitHub credentials.
+- Before mutating a pull request, review, issue, or branch, verify the target repository and resource number. For review- or merge-related operations, also verify the current head SHA where relevant.
+- Use normal workspace-scoped execution for local file reads, local file edits, and deterministic checks.
+
+The fallback changes only the transport used for a GitHub operation. It does not
+relax approval, review, status-transition, branch-protection, or merge gates. A
+fallback mutation must produce the same durable GitHub evidence required by the
+workflow that requested it.
+
+For review-thread resolution, refresh the pull request and thread first, confirm
+that the thread belongs to the verified pull request, and resolve it only when
+the finding is superseded. For formal reviews and separate-session reviews,
+record evidence against the verified current head SHA. For merges, refresh the
+head SHA and every required gate immediately before the merge mutation.
+
+Three steps need the `gh` CLI (2.50 or later) authenticated with GraphQL access:
+`scripts/ac-summary.sh`, review-thread resolution, and
+`scripts/merge-gate-summary`. The commands write no board status. GitHub Actions and a local session provide this; a
+Claude Code cloud session does not, and the Codex sandbox may not. The symptom
+is HTTP 403 "GraphQL is not available from Claude Code sessions" or
+`gh: command not found`. The merge gate is never skipped, so
+`/merge` requires the capability and stops before any GitHub mutation without
+it.
+
+## Codex Review Requests
+
+The Codex review trigger phrase (ADR-006 → Decision) starts a Codex task
+wherever it is written. Post it only as a PR conversation comment that requests
+a review, and only from `/implement` or the `codex-review-bookkeeping` workflow.
+Never write it in an issue body, an issue comment, a PR description or any
+other PR comment. In documentation and tests, refer to ADR-006 or to the shared
+constant in `src/headless_pr_workflow/review_policy.py` instead of repeating
+the phrase.
+
+## Stale Checkout Handling
+
+The sandbox workspace may be initialized from an older checkout and `git fetch` may be blocked. At the start of each session:
+
+1. Run `git log --oneline -1` to get the local HEAD commit.
+2. Use the GitHub plugin to get the latest commit SHA on `main`.
+3. If they differ, the local checkout is stale — do not trust local file contents.
+4. Read all repository files via the GitHub plugin (`get_file_contents`) instead of the local filesystem until the checkout is current.
+5. For edits: write changes to local files as normal, but verify against the remote version first so edits apply on top of the current content.
+6. If `git push` or `git fetch` fails due to sandbox restrictions, use the GitHub plugin's `push_files` tool to push file changes directly via the API — do not give up or report a blocker.
+7. To create a PR when git CLI is unavailable, use the GitHub plugin's `create_pull_request` tool directly.
+
+## Running Tests
+
+Run focused tests locally; the full suite runs in CI. Select the test files for the
+changed modules or scripts and for directly affected callers, commands, or contracts:
+
+```
+python -m pytest tests/test_example.py tests/test_other.py
+```
+
+Test file names do not always mirror production file names. Use repository search
+(for example `grep -rn "<changed-name>" tests/ src/ scripts/ docs/ .claude/`) to find
+indirect callers and test coverage. Record the selected files and the reason for
+including them in the implementation handoff.
+
+Shared test infrastructure (`conftest.py`, `tests/dispatcher_fakes.py`, or any other
+shared fixture or helper) needs a wider set: every test file that uses it, or a
+representative local subset when that set is too large. State any omitted local
+coverage and why in the handoff. The full CI suite is mandatory in either case.
+
+CI also runs the suite on every push to `main`, and `/verify-closure` uses that run for the verified `main` SHA as its full-suite evidence, and for each criterion test file it executes, instead of a local run.
+
+The complete suite is `python -m pytest`. It is slow on Windows (tens of minutes),
+so run it locally only intentionally; `.github/workflows/tests.yml` runs it on every
+PR. Before marking a PR Ready for review, the required `pytest` check must be green
+for the exact current PR head SHA (see `.claude/commands/implement.md`).
+
+Run a single test or file serially, without `-n`, when debugging:
+
+```
+python -m pytest tests/path.py::test_name
+```
+
+Run the complete suite serially with `python -m pytest`, or in parallel with
+`pytest-xdist` (installed by the `dev` extra) using:
+
+```
+python -m pytest -n 4
+```
+
+Locally, use 4 workers rather than `-n auto`. On a 16-core Windows machine, `-n 4`
+ran the suite about three times faster than serial with no new failures, while
+`-n auto` (16 workers) added failures. CI runs the full suite with `-n auto`, which
+is 4 workers on its runner. Parallel execution is not a pytest default
+(no `addopts`), so targeted runs stay serial. On the Windows Codex fallback use
+`py -3.12 -m pytest` and `py -3.12 -m pytest -n 4`. Each xdist worker gets its own
+`popen-gwN` directory under the temp base below, so workers do not share temp trees.
+
+The root-level `conftest.py` points pytest's temp root (`PYTEST_DEBUG_TEMPROOT`, when you have not set it) at `.pytest_sessions/` one level above the repo root (outside the git working tree) to avoid two issues: the system temp directory may not be writable in sandboxed environments like Codex, and a temp dir inside the repo causes tests that expect a non-git environment to fail. Under that root every pytest session gets its own locked tree, `.pytest_sessions/pytest-of-<user>/pytest-<N>/`; pytest keeps the last 3 and never removes a tree that a running session holds, so concurrent runs in sibling worktrees or in the same checkout do not delete each other's files. A checkout from before #384 still uses `.pytest_tmp/` and empties it at every start; the new folder name keeps such a run from deleting a new session's files.
+
+Shell tests in `tests/test_*.sh` run through pytest: `tests/test_shell_tests.py` finds every such file at collection time and runs it as its own test with `bash` (300-second timeout; a timed-out test stops its whole process tree), so the required `pytest` check covers them and a new file needs no registration. They need `bash` and `jq` 1.7 or later on every platform; a missing tool skips the test with its name. Three files are skipped on Windows with a stated reason (no executable bit on NTFS, or a hang under Git Bash).
+
+On Windows, run the suite with Git for Windows (its Git Bash runs the shell-script tests, never WSL's `C:\Windows\System32\bash.exe`) and `jq` on `PATH`. There the script-test harnesses (`tests/script_tools.py`) keep the host `PATH` behind their fakes, and they skip with the missing tool's name when one is absent. `.gitattributes` checks shell scripts out with LF; a checkout made before it landed keeps CRLF scripts until they are checked out again (for example `git rm --cached -r . && git reset --hard`, or a fresh worktree). One test is skipped on Windows by design: `test_real_hpw_merge_owner_reports_the_failing_gh_call` runs the real `hpw`, whose Python `subprocess` can start `gh.exe` but not the bash `gh` fake.
+
+On Windows two Git Bash habits would otherwise break scripts that pass on Linux, so the harnesses work around them (#398): a native `jq.exe` ends lines with CRLF, so `windows_env()` sets `BASH_ENV` to `tests/windows_bash_env.sh`, which defines `jq` as `jq -b`; and Git Bash rewrites an argument such as `/review #398` to `C:/Program Files/Git/review #398`, so `windows_env()` sets `MSYS2_ARG_CONV_EXCL` for the slash-command names only. A new harness that runs a script under Git Bash takes its `PATH` from `script_path()` or `host_script_path()` and its environment from `windows_env()`.
+
+**Fallback**: If you still encounter temp-directory setup errors (e.g. on Windows environments where the parent directory is also restricted), set the environment variable before running:
+
+```
+PYTEST_DEBUG_TEMPROOT=C:\tmp  # Windows / Codex Windows sandbox
+```
+
+`C:\tmp` is a confirmed writable location in the Codex Windows sandbox. On Linux/macOS, the `conftest.py` fix should be sufficient without any env-var override.
+
+## Codex Sandbox Constraints
+
+Quick reference for constraints specific to the Codex Windows sandbox. Each entry: constraint — symptom — workaround.
+
+| Constraint | Symptom | Workaround |
+|---|---|---|
+| `.git/` directory operations blocked | `git switch`, `git fetch` fail with lock or permission errors | Use `mcp__github__*` tools for all branch and commit operations. See [Stale Checkout Handling](#stale-checkout-handling). |
+| Default Python version lacks pytest | `python -m pytest` → `No module named pytest` | Use `py -3.12 -m pytest`. Run `py -0p` to list available Python versions. |
+| pytest temp root outside sandbox | Setup errors on first test run | `conftest.py` sets the temp root to `.pytest_sessions/` above the repo when `PYTEST_DEBUG_TEMPROOT` is unset (#135, #384). If errors persist, set `PYTEST_DEBUG_TEMPROOT=C:\tmp`. See [Running Tests](#running-tests). |
+| `gh` CLI blocked | `gh issue view` and similar commands are denied | Use `mcp__github__*` tools exclusively. `/merge` cannot run there because the merge gate needs GraphQL-capable `gh`. See [GitHub Operations](#github-operations). |
+
+## Branch Naming
+
+Name every branch `<agent>/issue-<number>-<short-slug>`, or
+`<agent>/<kind>-<short-slug>` when there is no issue, as defined in
+[docs/WORKTREE-MODEL.md](docs/WORKTREE-MODEL.md#naming). The name must say what
+the branch is for; no random suffixes.
+
+## Review Guidelines
+
+This section applies only to automated pull request reviewers acting with no
+human request, such as Codex Cloud automatic review and the Codex Cloud review
+requested by the trigger-phrase PR comment (ADR-006 → Decision), whoever posts
+that comment. Any other human-requested review, including `/review <n>` or "review
+PR <n>" asked of an assistant session, follows `.claude/commands/review.md` in
+full, read before anything is posted to GitHub.
+
+This section applies to automated pull request reviewers, such as Codex Cloud
+automatic review, that can comment on a PR but do not run the full `/review`
+workflow in `.claude/commands/review.md` (board transitions, formal approval,
+session summary).
+
+Review the PR's current head commit for:
+
+- Correctness: logic errors, wrong conditions, off-by-one errors, unhandled
+  error paths, broken exit codes.
+- Workflow-policy safety: anything that would let a PR merge without the gates
+  in `docs/MERGE-POLICY.md` — approval gate satisfied for the reviewed head SHA, green
+  required checks, no unresolved review threads, a fresh refresh before merge.
+- Tests: behavior changes without a deterministic test that would fail on the
+  bug.
+- Consistency: a change to workflow behavior that contradicts `docs/*.md` or an
+  accepted ADR in `docs/decisions/` without updating it.
+- Acceptance criteria: when the PR is linked to an issue, every acceptance
+  criterion in that issue is met by the change and, where it is testable,
+  covered by a test. An unmet or untested criterion is a P1 finding.
+
+For every finding, state the file and line, the concrete consequence, and a
+reproduction case or failing input. Mark each finding `Blocker` or
+`Out of scope`, with the reason, against the linked issue's acceptance
+criteria, scope and out-of-scope sections: a `Blocker` breaks or does not meet
+them or is a defect the PR introduced; `Out of scope` is a valid observation
+the story does not own. When in doubt, mark it `Blocker`. Do not report again an
+`Out of scope` finding the PO waived on the PR (a PO comment naming it); a Blocker is never waived, so keep reporting it. Report only P0/P1 issues; do not comment on
+style, naming, or formatting. If you find no P0/P1 issues, say so explicitly
+and name the head commit you reviewed.
+
+When fixing a review finding that a deterministic test could have caught, add
+that test in the same fix.
+
+## Intent
+
+The goal is to avoid wasted retries caused by sandbox restrictions. The GitHub plugin handles all GitHub API needs; local execution handles repo file operations only when the checkout is confirmed current.
+
+## Workflow Commands
+
+To specify an Epic with the PO: Follow `.claude/commands/spec.md` with no argument, a quoted working title, or the Epic issue number; it opens a spec PR that only the PO merges.
+To refine an issue: Follow `.claude/commands/refine.md` with the issue number.
+To implement an issue: Follow `.claude/commands/implement.md` with the issue number.
+To review a PR: Follow `.claude/commands/review.md` with the PR number.
+In Codex, `/review` collides with Codex's built-in reviewer, so `/review <n>` does not reliably reach the repo command; instead say "Follow .claude/commands/review.md for PR <n>".
+To merge a PR: Follow `.claude/commands/merge.md` with the PR number.
+To clean up after a merged PR: Follow `.claude/commands/cleanup.md` with the PR number.
+To verify Feature or Epic closure: Follow `.claude/commands/verify-closure.md`
+with exactly one issue number. This first phase is read-only with respect to
+repository contents and issue lifecycle state; only its single successful
+technical-evidence comment is permitted before PO product confirmation.
+After that confirmation, run the same command again for the fail-closed,
+idempotent closure continuation documented by the command contract.

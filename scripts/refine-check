@@ -1,0 +1,574 @@
+#!/usr/bin/env python3
+"""Check that a refined issue's labels, dependencies and body are complete.
+
+Usage:
+  scripts/refine-check --issue <n> [--repo <owner/repo>] [--json]
+
+--repo defaults to $GITHUB_REPOSITORY. The first output line is the verdict,
+then one line per check: `<check-id>: pass|fail|skip - <detail>`.
+
+Exit codes:
+  0  every applicable check passes.
+  1  one or more checks fail; each failure is named.
+  2  the issue, its labels, the repository label list, a dependency or the
+     recorded spec could not be read (a spec read that fails for a
+     reason other than not found), or the arguments are invalid. Never a pass.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import posixpath
+import re
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+
+REPO_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+
+# Source of the values: STORY_TYPES in src/headless_pr_workflow/dispatcher/facts.py.
+ISSUE_TYPES = ("epic", "feature", "story", "task", "bug")
+EXECUTABLE_TYPES = ("story", "task", "bug")
+
+_TASK_SECTIONS = (
+    "Goal", "Scope", "Out of Scope", "Acceptance Criteria",
+    "Epic and Feature Requirements Mapping", "Test Expectations",
+    "Documentation Impact", "Dependencies", "Assumptions", "Risks / Blockers",
+    "Technical Notes", "Definition of Done",
+)
+# Each entry is a list of accepted heading alternatives.
+REQUIRED_SECTIONS: dict[str, tuple[tuple[str, ...], ...]] = {
+    "epic": tuple((s,) for s in ("Goal",)) + (("Why / Background", "Why"),)
+    + tuple((s,) for s in ("Scope", "Non-goals", "Success Criteria", "Dependencies")),
+    "feature": tuple((s,) for s in (
+        "Goal", "Why", "Scope", "Out of Scope", "Success Criteria", "Dependencies", "Assumptions")),
+    "story": tuple((s,) for s in (
+        "Goal", "User Story / Problem Statement", "Business Value", "Why", "Scope", "Out of Scope",
+        "Acceptance Criteria", "Epic and Feature Requirements Mapping", "Test Expectations",
+        "Documentation Impact", "Dependencies", "Assumptions", "Risks / Blockers",
+        "Technical Notes", "Definition of Done")),
+    "task": tuple((s,) for s in _TASK_SECTIONS),
+    "bug": tuple((s,) for s in (
+        "Goal", "Defect Description", "Impact", "Scope", "Out of Scope", "Acceptance Criteria",
+        "Epic and Feature Requirements Mapping", "Test Expectations", "Documentation Impact",
+        "Dependencies", "Assumptions", "Risks / Blockers", "Technical Notes",
+        "Definition of Done")),
+}
+
+TITLE_PREFIX = re.compile(r"^\s*(?:\[(epic|feature|story|task|bug)\]|(epic|feature|story|task|bug)\s*:)", re.I)
+
+
+CATCH_ALL_MODULE = Path(__file__).resolve().parent.parent / "src" / "headless_pr_workflow" / "catch_all.py"
+# Allowed maintenance classes of spec #530 (the general line).
+MAINTENANCE_CLASSES = ("M1", "M2", "M3", "M4", "M6", "M8")
+CLASS_TOKEN = re.compile(r"\bM\d+\b")
+SORT_HEADING = re.compile(r"^###\s+Catch-all sort\b.*$", re.M)
+
+
+# Size gate and executor-by-size rule (Epic #418 spec, E7; issue #545).
+MAX_FILES = 10
+MAX_TEST_FILES = 5
+HAIKU_MAX_FILES = 3
+HAIKU_LABEL = "executor:claude-code-haiku"
+# Orchestration executor rule (Epic #418 spec, F3.6; issue #367).
+ORCHESTRATION_TRIGGER_LABELS = ("flow:orchestration", "cp:critical-path")
+OPUS_LABEL = "executor:claude-code-opus"
+KEEP_TOGETHER = re.compile(r"^[ \t]*(?:[-*]\s+)?Split decision:\s*keep together because[ \t]+\S", re.I | re.M)
+VERBATIM_DECLARATION = re.compile(r"verbatim|word[- ]for[- ]word|read exactly", re.I)
+TESTS_DIR = Path(__file__).resolve().parent.parent / "tests"
+TEST_SOURCE_SUFFIXES = (".py", ".sh")
+
+
+class ReadError(Exception):
+    """A GitHub read failed; the check cannot pass."""
+
+
+@dataclass(frozen=True)
+class Issue:
+    number: int
+    title: str
+    body: str
+    labels: tuple[str, ...]
+    state: str
+
+
+@dataclass(frozen=True)
+class Check:
+    id: str
+    status: str  # pass | fail | skip
+    detail: str
+
+
+# --- GitHub reads (stubbed in tests) -------------------------------------------------
+
+def _gh(args: list[str], what: str) -> str:
+    try:
+        result = subprocess.run(
+            ["gh", *args], capture_output=True, encoding="utf-8", check=False,
+            env={**os.environ, "GH_PROMPT_DISABLED": "1"},
+        )
+    except FileNotFoundError as error:
+        raise ReadError(f"{what}: gh is not installed") from error
+    if result.returncode != 0:
+        detail = " ".join(result.stderr.split())[:200] or f"exit {result.returncode}"
+        raise ReadError(f"{what}: {detail}")
+    return result.stdout
+
+
+def read_issue(repo: str, number: int) -> Issue:
+    out = _gh(["issue", "view", str(number), "--repo", repo, "--json", "number,title,body,labels,state"],
+              f"issue #{number}")
+    try:
+        raw = json.loads(out)
+        return Issue(
+            number=int(raw["number"]), title=str(raw["title"]), body=str(raw.get("body") or ""),
+            labels=tuple(str(label["name"]) for label in raw["labels"]), state=str(raw["state"]),
+        )
+    except (ValueError, KeyError, TypeError) as error:
+        raise ReadError(f"issue #{number}: payload could not be parsed ({error})") from error
+
+
+def read_repo_labels(repo: str) -> set[str]:
+    out = _gh(["label", "list", "--repo", repo, "--limit", "1000", "--json", "name"], "repository labels")
+    try:
+        return {str(item["name"]) for item in json.loads(out)}
+    except (ValueError, KeyError, TypeError) as error:
+        raise ReadError(f"repository labels: payload could not be parsed ({error})") from error
+
+
+def spec_exists(repo: str, path: str, ref: str) -> bool:
+    """True when `path` exists at `ref`; False when GitHub answers not found."""
+    try:
+        _gh(["api", f"repos/{repo}/contents/{path}?ref={ref}", "--jq", ".type"], f"spec {path} at {ref}")
+    except ReadError as error:
+        text = str(error).lower()
+        if "http 404" in text or "not found" in text or "no commit found" in text:
+            return False
+        raise
+    return True
+
+
+# --- body parsing --------------------------------------------------------------------
+
+def parse_sections(body: str) -> dict[str, str]:
+    """Map each `## ` heading to its text; headings inside code fences are ignored."""
+    sections: dict[str, list[str]] = {}
+    current: str | None = None
+    fenced = False
+    for line in body.replace("\r\n", "\n").split("\n"):
+        if line.lstrip().startswith("```"):
+            fenced = not fenced
+        match = None if fenced else re.match(r"^##\s+(.+?)\s*$", line)
+        if match:
+            current = match.group(1)
+            sections.setdefault(current, [])
+        elif current is not None:
+            sections[current].append(line)
+    return {name: "\n".join(lines).strip() for name, lines in sections.items()}
+
+
+def hard_dependencies(sections: dict[str, str], own: int) -> list[int]:
+    text = sections.get("Dependencies", "")
+    collected: list[str] = []
+    active = False
+    for line in text.split("\n"):
+        bare = line.strip().strip("*_ ").lower()
+        if bare.startswith("hard depends on"):
+            active = True
+            continue
+        if bare.startswith(("soft depends on", "revalidate after")):
+            active = False
+        if active:
+            collected.append(line)
+    numbers = [int(n) for n in re.findall(r"#(\d+)", "\n".join(collected))]
+    return sorted({n for n in numbers if n != own})
+
+
+def has_hard_dependency_entry(sections: dict[str, str]) -> bool:
+    """True when `## Dependencies` has a `Hard depends on` label (an entry reading `None.` counts)."""
+    return any(line.strip().strip("*_ ").lower().startswith("hard depends on")
+               for line in sections.get("Dependencies", "").split("\n"))
+
+
+def unnumbered_dependencies(sections: dict[str, str]) -> list[str]:
+    """Hard-dependency entries with no issue number that are not a `none` entry (#529).
+
+    Own copy lives in src/headless_pr_workflow/dispatcher/facts.py; tests check that they agree.
+    """
+    entries: list[list[str]] = []
+    active = False
+    for line in sections.get("Dependencies", "").split("\n"):
+        bare = line.strip().strip("*_ ").lower()
+        if bare.startswith("hard depends on"):
+            active = True
+            rest = re.sub(r"^[\s*_]*hard depends on[\s*_]*:?[\s*_]*", "", line.strip(), flags=re.I).strip()
+            entries = [[rest]] if rest else []
+            continue
+        if bare.startswith(("soft depends on", "revalidate after")):
+            active = False
+        if not active or not line.strip():
+            continue
+        item = re.match(r"^[-*]\s+(?:\[[ xX]\]\s*)?(.*)$", line)
+        if item:
+            entries.append([item.group(1)])
+        elif entries:
+            entries[-1].append(line.strip())
+        else:
+            entries.append([line.strip()])
+    texts = [" ".join(part for part in entry if part).strip() for entry in entries]
+    return [t for t in texts if t and not re.search(r"#\d+", t) and not re.match(r"^[\s*_]*none\b", t, re.I)]
+
+
+SPEC_LINE = re.compile(r"^[ \t]*Spec:\s*\[`([^`]+)`\]\((\S+)\)\s+at\s+`([0-9a-fA-F]{7,40})`(?:\s.*)?$", re.M)
+FEATURE_PREFIX = re.compile(r"^[ \t]*Criterion prefix:\s*F(\d+)\b", re.I | re.M)
+# Same format as scripts/criteria-check: `**F<k>.<m>** (serves E<n>, ...) - text`.
+FEATURE_CRITERION = re.compile(r"\*\*F(\d+)\.\d+\*\*\s*\(serves\s+([^)]*)\)", re.I)
+
+
+def list_items(text: str) -> list[str]:
+    """Top-level list items of a section; indented lines continue the previous item."""
+    items: list[list[str]] = []
+    fenced = False
+    for line in text.split("\n"):
+        if line.lstrip().startswith("```"):
+            fenced = not fenced
+        match = None if fenced else re.match(r"^[-*]\s+(?:\[[ xX]\]\s*)?(.*)$", line)
+        if match:
+            items.append([match.group(1)])
+        elif items and (fenced or line.startswith((" ", "\t"))):
+            items[-1].append(line.strip())
+    return [" ".join(part for part in item if part).strip() for item in items]
+
+
+def type_labels(issue: Issue) -> list[str]:
+    return [label.split(":", 1)[1] for label in issue.labels if label.startswith("type:")]
+
+
+def catch_all_feature() -> int:
+    """The catch-all Feature number, parsed from catch_all.py (the script is stdlib-only, so no import)."""
+    try:
+        text = CATCH_ALL_MODULE.read_text(encoding="utf-8")
+    except OSError as error:
+        raise ReadError(f"catch_all.py: {error}") from error
+    match = re.search(r"^CATCH_ALL_FEATURE\s*=\s*(\d+)\s*$", text, re.M)
+    if not match:
+        raise ReadError("catch_all.py: no CATCH_ALL_FEATURE constant")
+    return int(match.group(1))
+
+
+def catch_all_sort_check(issue: Issue) -> Check:
+    feature = re.search(r"^[ \t]*Feature group:\s*#(\d+)\b", issue.body.replace("\r\n", "\n"), re.I | re.M)
+    if not feature or int(feature.group(1)) != catch_all_feature():
+        return Check("catch_all_sort", "skip", "not under the catch-all Feature")
+    decisions = parse_sections(issue.body).get("Decisions", "")
+    starts = [m.start() for m in SORT_HEADING.finditer(decisions)]
+    if not starts:
+        return Check("catch_all_sort", "fail", "no sort entry")
+    rest = decisions[starts[-1]:].split("\n", 1)[1] if "\n" in decisions[starts[-1]:] else ""
+    entry = re.split(r"^###\s", rest, maxsplit=1, flags=re.M)[0]
+    classes = sorted(set(CLASS_TOKEN.findall(entry)))
+    if len(classes) > 1:
+        return Check("catch_all_sort", "fail", "entry names more than one class")
+    if not classes:
+        return Check("catch_all_sort", "fail", "class <none> is not allowed maintenance")
+    if classes[0] not in MAINTENANCE_CLASSES:
+        return Check("catch_all_sort", "fail", f"class {classes[0]} is not allowed maintenance")
+    return Check("catch_all_sort", "pass", f"maintenance {classes[0]}")
+
+
+def inventory_paths(sections: dict[str, str]) -> tuple[list[tuple[str, str]], list[str]]:
+    """Distinct (path, item text) pairs of `## Files affected`, and the entries that are not file paths."""
+    paths: dict[str, str] = {}
+    bad: list[str] = []
+    for item in list_items(sections.get("Files affected", "")):
+        ticked = re.match(r"^`([^`]+)`", item)
+        token = ticked.group(1) if ticked else item.split()[0] if item.split() else ""
+        token = token.strip()
+        if token and not token.startswith("/") and not token.endswith("/"):
+            token = posixpath.normpath(token)
+        if token == "." or token.startswith("../") or (TESTS_DIR.parent / token).is_dir() or not token or token.endswith("/") or token.startswith("/") or re.search(r"[*?\[\]{}]|\s", token):
+            bad.append(token or item)
+        else:
+            paths.setdefault(token, item)
+    return list(paths.items()), bad
+
+
+def read_test_sources() -> dict[str, str]:
+    """Text of the tracked test sources, keyed by repository-relative path."""
+    try:
+        files = sorted(f for f in TESTS_DIR.rglob("*") if f.is_file() and f.suffix in TEST_SOURCE_SUFFIXES)
+        return {f.relative_to(TESTS_DIR.parent).as_posix(): f.read_text(encoding="utf-8", errors="replace") for f in files}
+    except OSError as error:
+        raise ReadError(f"test sources: {error}") from error
+
+
+def size_checks(issue: Issue, effective: str | None, test_reader) -> list[Check]:
+    ids = ("files_affected", "size_split", "haiku_limit")
+    if effective not in EXECUTABLE_TYPES:
+        return [Check(i, "skip", "issue type unknown" if effective is None else f"not applicable to type:{effective}") for i in ids]
+    sections = parse_sections(issue.body)
+    entries, bad = inventory_paths(sections)
+    if bad or not entries:
+        reason = ("entries that are not individual repository-relative file paths: " + ", ".join(f"'{b}'" for b in bad)
+                  if bad else "no '## Files affected' list of individual file paths")
+        return [Check("files_affected", "fail", reason),
+                Check("size_split", "skip", "no usable file inventory"), Check("haiku_limit", "skip", "no usable file inventory")]
+    paths = [path for path, _ in entries]
+    tests = [path for path in paths if path.startswith("tests/")]
+    checks = [Check("files_affected", "pass", f"{len(paths)} files, {len(tests)} test files")]
+    haiku = HAIKU_LABEL in issue.labels
+    sonnet_plus = not haiku
+    over = []
+    if len(paths) > MAX_FILES:
+        over.append(f"{len(paths)} files exceed {MAX_FILES}")
+    if len(tests) > MAX_TEST_FILES:
+        over.append(f"{len(tests)} test files exceed {MAX_TEST_FILES}")
+    keep = KEEP_TOGETHER.search(issue.body.replace("\r\n", "\n"))
+    if not over:
+        checks.append(Check("size_split", "pass", "within the size limits"))
+    elif not keep:
+        checks.append(Check("size_split", "fail", "; ".join(over) + "; split the issue or record 'Split decision: keep together because <reason>'"))
+    elif not sonnet_plus:
+        checks.append(Check("size_split", "fail", "; ".join(over) + f"; keep-together needs at least executor:claude-code-sonnet, found {HAIKU_LABEL}"))
+    else:
+        checks.append(Check("size_split", "pass", "; ".join(over) + "; kept together with a recorded reason"))
+    if not haiku:
+        checks.append(Check("haiku_limit", "skip", "executor is not Haiku"))
+        return checks
+    problems = []
+    if len(paths) > HAIKU_MAX_FILES:
+        problems.append(f"{len(paths)} files exceed the Haiku limit of {HAIKU_MAX_FILES}")
+    declared = [path for path, item in entries if VERBATIM_DECLARATION.search(item)]
+    sources = test_reader()
+    matched = [path for path in paths if path not in declared and any(
+        path in text or Path(path).name in text for name, text in sources.items() if name != path)]
+    for path in declared:
+        problems.append(f"{path} is declared as read verbatim")
+    for path in matched:
+        problems.append(f"{path} is referenced by a test, so it may be read word for word")
+    checks.append(Check("haiku_limit", "fail", "; ".join(problems) + "; use at least executor:claude-code-sonnet")
+                  if problems else Check("haiku_limit", "pass", f"{len(paths)} files, none read word for word"))
+    return checks
+
+
+# --- checks --------------------------------------------------------------------------
+
+def run_checks(issue: Issue, repo: str, *, issue_reader=None, labels_reader=None, spec_reader=None, test_reader=None) -> tuple[str | None, list[Check]]:
+    issue_reader = issue_reader or read_issue
+    labels_reader = labels_reader or read_repo_labels
+    spec_reader = spec_reader or spec_exists
+    test_reader = test_reader or read_test_sources
+    checks: list[Check] = []
+
+    types = type_labels(issue)
+    prefix = TITLE_PREFIX.match(issue.title)
+    prefix_type = (prefix.group(1) or prefix.group(2)).lower() if prefix else None
+    if len(types) != 1 or types[0] not in ISSUE_TYPES:
+        checks.append(Check("type_label", "fail", f"expected exactly one type: label, found {len(types)} ({', '.join(types) or 'none'})"))
+        effective = prefix_type
+    elif prefix_type and prefix_type != types[0]:
+        checks.append(Check("type_label", "fail", f"label type:{types[0]} disagrees with title prefix '{prefix_type}'"))
+        effective = types[0]
+    else:
+        checks.append(Check("type_label", "pass", f"type:{types[0]}"))
+        effective = types[0]
+
+    execs = [label for label in issue.labels if label.startswith("executor:")]
+    if effective is None:
+        checks.append(Check("executor_label", "skip", "issue type unknown"))
+    elif effective not in EXECUTABLE_TYPES:
+        checks.append(Check("executor_label", "skip", f"not applicable to type:{effective}"))
+    elif len(execs) != 1:
+        checks.append(Check("executor_label", "fail", f"expected exactly one executor: label on a {effective}, found {len(execs)}"))
+    elif execs[0] not in labels_reader(repo):
+        checks.append(Check("executor_label", "fail", f"{execs[0]} does not exist in {repo}"))
+    else:
+        checks.append(Check("executor_label", "pass", execs[0]))
+
+    triggers = [label for label in ORCHESTRATION_TRIGGER_LABELS if label in issue.labels]
+    if effective not in EXECUTABLE_TYPES:
+        checks.append(Check("orchestration_executor", "skip", "not applicable to this issue type"))
+    elif not triggers:
+        checks.append(Check("orchestration_executor", "skip", "no flow:orchestration or cp:critical-path label"))
+    elif execs == [OPUS_LABEL]:
+        checks.append(Check("orchestration_executor", "pass", f"{', '.join(triggers)} with {OPUS_LABEL}"))
+    else:
+        checks.append(Check("orchestration_executor", "fail", f"{', '.join(triggers)} requires exactly {OPUS_LABEL}, found {', '.join(execs) or 'no executor: label'}"))
+
+    prios = [label for label in issue.labels if label.startswith("prio:")]
+    checks.append(Check("prio_label", "pass", ", ".join(prios)) if prios else Check("prio_label", "fail", "no prio: label"))
+
+    sections = parse_sections(issue.body)
+    open_deps = []
+    for dep in hard_dependencies(sections, issue.number):
+        if issue_reader(repo, dep).state.upper() == "OPEN":
+            open_deps.append(dep)
+    refs = ", ".join(f"#{n}" for n in open_deps)
+    unnumbered = unnumbered_dependencies(sections)
+    if unnumbered:
+        listed = "; ".join(f"'{entry}'" for entry in unnumbered)
+        checks.append(Check("hard_dependencies", "fail", f"hard dependency without an issue number: {listed}; create or name an issue"))
+    elif effective in EXECUTABLE_TYPES and not has_hard_dependency_entry(sections):
+        checks.append(Check("hard_dependencies", "fail", "no 'Hard depends on' entry in Dependencies (write 'None.' when there is none)"))
+    else:
+        checks.append(Check("hard_dependencies", "pass", f"open: {refs}" if open_deps else "no open hard dependency"))
+
+    if effective is None:
+        checks.append(Check("required_sections", "skip", "issue type unknown"))
+    else:
+        missing = []
+        for alternatives in REQUIRED_SECTIONS[effective]:
+            if not any(sections.get(name) for name in alternatives):
+                missing.append(alternatives[0])
+        checks.append(
+            Check("required_sections", "fail", "missing or empty: " + ", ".join(missing))
+            if missing else Check("required_sections", "pass", f"all {len(REQUIRED_SECTIONS[effective])} sections present"))
+
+    questions = sections.get("Open Questions", "")
+    if re.search(r"^###\s+\S", questions, re.M):
+        checks.append(Check("open_questions", "fail", "Open Questions still contains a '### ' question"))
+    elif not re.fullmatch(r"(?:[-*]\s*)?none\.?", questions.strip(), re.I) and questions.strip():
+        checks.append(Check("open_questions", "fail", "Open Questions lists an unresolved item (a decision blocker link); it must read 'None.'"))
+    else:
+        checks.append(Check("open_questions", "pass", "no open question"))
+
+    if effective == "epic":
+        checks.append(Check("parent_refs", "skip", "an Epic has no parent"))
+    else:
+        problems = []
+        parent = re.search(r"^[ \t]*Parent epic:\s*(.*)$", issue.body, re.I | re.M)
+        if not parent or not re.search(r"#\d+", parent.group(1)):
+            problems.append("no 'Parent epic: #N' line")
+        feature = re.search(r"^[ \t]*Feature group:\s*(.*)$", issue.body, re.I | re.M)
+        if effective == "feature":
+            feature = None
+        wanted = [parent.group(1) if parent else "", feature.group(1) if feature else ""]
+        for number in sorted({int(n) for text in wanted for n in re.findall(r"#(\d+)", text)}):
+            try:
+                issue_reader(repo, number)
+            except ReadError as error:
+                if "not found" in str(error).lower() or "could not resolve" in str(error).lower():
+                    problems.append(f"#{number} does not resolve")
+                else:
+                    raise
+        checks.append(Check("parent_refs", "fail", "; ".join(problems)) if problems else Check("parent_refs", "pass", "parent references resolve"))
+
+    checks.append(spec_record_check(issue, repo, effective, spec_reader))
+    checks.append(feature_criteria_check(issue, effective))
+    checks.append(catch_all_sort_check(issue))
+    checks.extend(size_checks(issue, effective, test_reader))
+    return effective, checks
+
+
+def spec_record_check(issue: Issue, repo: str, effective: str | None, spec_reader) -> Check:
+    body = issue.body.replace("\r\n", "\n")
+    match = SPEC_LINE.search(body)
+    if effective is None:
+        return Check("spec_record", "skip", "issue type unknown")
+    if not match:
+        found = re.search(r"^[ \t]*Spec:", body, re.M)
+        return Check("spec_record", "fail", "malformed 'Spec:' line" if found else "no 'Spec:' line")
+    path, _, commit = match.groups()
+    if effective == "epic":
+        epic = issue.number
+    else:
+        parent = re.search(r"^[ \t]*Parent epic:\s*#(\d+)\b", body, re.I | re.M)
+        if not parent:
+            return Check("spec_record", "fail", "no 'Parent epic: #N' line to match the spec path against")
+        epic = int(parent.group(1))
+    if not re.fullmatch(rf"specs/{epic}-[^/]+/spec\.md", path):
+        return Check("spec_record", "fail", f"path '{path}' is not specs/{epic}-*/spec.md")
+    if not spec_reader(repo, path, commit):
+        return Check("spec_record", "fail", f"{path} does not exist at {commit}")
+    return Check("spec_record", "pass", f"{path} at {commit}")
+
+
+def feature_criteria_check(issue: Issue, effective: str | None) -> Check:
+    if effective != "feature":
+        return Check("feature_criteria", "skip", "only applies to type:feature")
+    prefix = FEATURE_PREFIX.search(issue.body.replace("\r\n", "\n"))
+    if not prefix:
+        return Check("feature_criteria", "fail", "no 'Criterion prefix: F<k>' line")
+    wanted = int(prefix.group(1))
+    items = list_items(parse_sections(issue.body).get("Success Criteria", ""))
+    for position, item in enumerate(items, start=1):
+        match = FEATURE_CRITERION.match(item)
+        if not match or int(match.group(1)) != wanted or not re.search(r"\bE\d+", match.group(2), re.I):
+            return Check("feature_criteria", "fail", f"item {position} does not match '**F{wanted}.<m>** (serves E<n>)'")
+    return Check("feature_criteria", "pass", f"{len(items)} criteria use prefix F{wanted} and name an Epic criterion")
+
+
+def verdict_line(number: int, checks: list[Check]) -> str:
+    applicable = [c for c in checks if c.status != "skip"]
+    failed = [c.id for c in applicable if c.status == "fail"]
+    if not failed:
+        return f"Refine check: #{number} pass"
+    return f"Refine check: #{number} fail ({len(failed)} of {len(applicable)}): {', '.join(failed)}"
+
+
+def positive_int(value: str) -> int:
+    if not re.fullmatch(r"[1-9][0-9]*", value):
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return int(value)
+
+
+def repository(value: str) -> str:
+    if not REPO_PATTERN.fullmatch(value):
+        raise argparse.ArgumentTypeError("must use owner/repo format")
+    return value
+
+
+class _Parser(argparse.ArgumentParser):
+    def error(self, message: str):  # exit 2 is argparse's default; keep the message on stderr
+        self.print_usage(sys.stderr)
+        print(f"refine-check: {message}", file=sys.stderr)
+        raise SystemExit(2)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = _Parser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--issue", required=True, type=positive_int, help="positive issue number")
+    parser.add_argument("--repo", type=repository, help="owner/repo (default: $GITHUB_REPOSITORY)")
+    parser.add_argument("--json", action="store_true", help="emit JSON")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    repo = args.repo or os.environ.get("GITHUB_REPOSITORY", "")
+    if not REPO_PATTERN.fullmatch(repo):
+        print("refine-check: --repo must be <owner/repo> (or set GITHUB_REPOSITORY)", file=sys.stderr)
+        return 2
+
+    try:
+        issue = read_issue(repo, args.issue)
+        effective, checks = run_checks(issue, repo)
+    except ReadError as error:
+        if args.json:
+            print(json.dumps({"issue": args.issue, "type": None, "verdict": "unreadable", "exit_code": 2,
+                              "reason": str(error), "checks": []}))
+        else:
+            print(f"Refine check: #{args.issue} unreadable: {error}")
+        return 2
+
+    failed = any(c.status == "fail" for c in checks)
+    code = 1 if failed else 0
+    if args.json:
+        print(json.dumps({
+            "issue": args.issue, "type": effective, "verdict": "fail" if failed else "pass",
+            "exit_code": code,
+            "checks": [{"id": c.id, "status": c.status, "detail": c.detail} for c in checks],
+        }))
+    else:
+        print(verdict_line(args.issue, checks))
+        for c in checks:
+            print(f"{c.id}: {c.status} - {c.detail}")
+    return code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
