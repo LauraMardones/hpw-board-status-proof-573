@@ -337,3 +337,67 @@ jobs:
       - name: Write the board status
         if: ${{ !cancelled() && needs.dispatch.outputs.enabled == 'true' }}
         run: bash scripts/dispatcher-workflow-step.sh status-sync
+
+  # Isolated independent setup review. Not a lifecycle proof or a production review.
+  command-context-review:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/codex/issue-1-command-context-review'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      REPO: LauraMardones/hpw-board-status-proof-573
+      GH_TOKEN: ${{ secrets.PROJECT_TOKEN }}
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      RESERVE_FIVE_HOUR_PERCENT: ${{ vars.RESERVE_FIVE_HOUR_PERCENT }}
+      RESERVE_WEEKLY_PERCENT: ${{ vars.RESERVE_WEEKLY_PERCENT }}
+      DECISION_BLOCKER_PO_LOGIN: LauraMardones
+    steps:
+      - name: Checkout verified setup review head
+        uses: actions/checkout@v4
+        with:
+          ref: e51868a5e8d33f88c7294efc6d5310bdd1076a99
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install existing runtime and test tools
+        run: pip install -e ".[dev]"
+      - name: Install pinned Claude Code
+        run: npm install -g @anthropic-ai/claude-code@2.1.296
+      - name: Ordinary subscription allowance gate
+        run: bash scripts/dispatcher-allowance.sh
+      - name: Independent Claude review of test setup PR only
+        shell: bash
+        run: |
+          set -euo pipefail
+          current=$(gh api repos/LauraMardones/hpw-board-status-proof-573/pulls/7 --jq '.head.sha')
+          [[ "$current" == "e51868a5e8d33f88c7294efc6d5310bdd1076a99" ]] || { echo "Review head changed; starting nothing"; exit 1; }
+          export REVIEW_WORK
+          REVIEW_WORK=$(mktemp -d)
+          trap 'rm -rf "$REVIEW_WORK"' EXIT
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          command = Path(".claude/commands/review.md").read_text().replace("$ARGUMENTS", "7")
+          boundary = """
+          Binding isolated review task:
+          Follow the review command above only for LauraMardones/hpw-board-status-proof-573 PR #7.
+          You are the independent Claude reviewer; Codex implemented this setup PR.
+          Verify and review exactly e51868a5e8d33f88c7294efc6d5310bdd1076a99; stop without approval if the head differs.
+          Scope: three copied command documents gain a final mandatory test-repository/board override. Preserve all current-head CI, review, thread and merge gates. Compare against main and assess that production mutations are excluded.
+          This setup PR only references setup issue #1; it does not deliver the later marker/evidence stories or production #573 acceptance proof.
+          Read repo AGENTS.md. Use the normal separate-session review-evidence text and exact generated Session Summary if no blockers; formal self-approval is unavailable on this single-maintainer account, so COMMENT evidence is the documented path.
+          Only normal review/comment mutations on this verified test PR are authorized. Do not merge, push, alter any source, change settings or secrets, or mutate production or any other issue/PR/project.
+          Never print credentials or environment contents. The current-head pytest must be green before relying on a clean handoff. This is an actual independent review, not claimed dispatcher/lifecycle evidence.
+          """
+          Path(os.environ["REVIEW_WORK"], "prompt.md").write_text(command + boundary)
+          PY
+          source scripts/lib/claude-session.sh
+          review_rc=0
+          claude_scrubbed_exec "$CLAUDE_CODE_OAUTH_TOKEN" timeout 600 claude -p --model sonnet --max-turns 20 --permission-mode bypassPermissions --strict-mcp-config --output-format stream-json --verbose < "$REVIEW_WORK/prompt.md" > "$REVIEW_WORK/stream.jsonl" 2> "$REVIEW_WORK/stderr.txt" || review_rc=$?
+          jq -cR 'fromjson? // empty | select(type=="object")' "$REVIEW_WORK/stream.jsonl" > "$REVIEW_WORK/events.jsonl"
+          jq -r --arg tok "$CLAUDE_CODE_OAUTH_TOKEN" 'select(.type=="result") | (.result // "no result") | split($tok) | join("[redacted]")' "$REVIEW_WORK/events.jsonl"
+          jq -se '([.[]|select(.type=="system" and .subtype=="init")]|last|.apiKeySource)=="none" and ([.[]|select(.type=="result")]|last|.subtype=="success" and .is_error==false)' "$REVIEW_WORK/events.jsonl" >/dev/null
+          exit "$review_rc"
