@@ -1,6 +1,6 @@
 Act as the Tech Lead (`docs/ROLES.md`) with GitHub access. Refinement makes no product decision (ADR-009 item 4).
 
-Refine GitHub issue #$ARGUMENTS in LauraMardones/hpw-board-status-proof-573 by identifying its type and following the correct refinement standard.
+Refine GitHub issue #$ARGUMENTS in LauraMardones/headless-pr-workflow by identifying its type and following the correct refinement standard.
 
 Do not implement code.
 
@@ -23,7 +23,7 @@ Before identifying the issue type, check whether recent implementations under th
 - If not found, log a note ("Parent Feature/Epic could not be determined — skipping usage-feedback check") and proceed immediately to Step 2.
 
 **Fetch recently closed/merged work under the parent (14-day lookback):**
-- Use `mcp__github__list_issues` with `state: closed` and a `since` filter set to 14 days ago, scoped to the repository `LauraMardones/hpw-board-status-proof-573`.
+- Use `mcp__github__list_issues` with `state: closed` and a `since` filter set to 14 days ago, scoped to the repository `LauraMardones/headless-pr-workflow`.
 - Filter results to items whose body references the parent issue number (e.g. `Parent epic: #N` or `Feature group: #N`), or search closed PRs via `mcp__github__list_pull_requests` with `state: closed` and the same date window.
 - If no recent items exist, proceed immediately to Step 2.
 
@@ -96,7 +96,7 @@ Never silently pick a type or apply a wrong label.
 
 **Issue body updated on GitHub** with refined content and **Session Summary posted** with `Next action: Ready for implementation`, `Next action: Refined; blocked by #X` or `Next action: Needs PO decision`, using the available GitHub operation fallback.
 
-Refinement is not complete until the sub-prompt's `## Refinement Completeness Gate (mandatory)` has run: `python3 scripts/refine-check --issue $ARGUMENTS --repo LauraMardones/hpw-board-status-proof-573` as the last step. Only exit `0` permits reporting `Refined` or `Ready for implementation`; on exit `1` or `2` the failing checks are listed as blockers. A re-refinement of an issue already `Ready for implementation` runs the same check. A `type:story`, `type:task` or `type:bug` issue needs exactly one existing `executor:` label. Statements about labels come from the check output.
+Refinement is not complete until the sub-prompt's `## Refinement Completeness Gate (mandatory)` has run: `python3 scripts/refine-check --issue $ARGUMENTS --repo LauraMardones/headless-pr-workflow` as the last step. Only exit `0` permits reporting `Refined` or `Ready for implementation`; on exit `1` or `2` the failing checks are listed as blockers. A re-refinement of an issue already `Ready for implementation` runs the same check. A `type:story`, `type:task` or `type:bug` issue needs exactly one existing `executor:` label. Statements about labels come from the check output.
 
 After refining, post a comment on the issue using this structure (omit inapplicable fields):
 
@@ -109,11 +109,12 @@ Blockers: <list, or "none">
 Next action: <"Ready for implementation" or "Needs PO decision">
 ```
 
-## Isolated proof repository context
+## Mandatory override for the isolated proof environment
 
-This command is installed only in the PO-approved test environment for production #573.
+This final section overrides all earlier repository and board literals in this copied command.
 For this invocation, the repository is LauraMardones/hpw-board-status-proof-573 and the only test board is LauraMardones/4.
-Apply that same repository and board context to every linked command, sub-prompt and source-document example, even when a copied file contains the production repository name or project #3.
-Verify the repository identity before every issue, PR, branch or project mutation. Never mutate production from this test invocation.
-Public production source may be read for provenance using its fully qualified repository or URL; a bare issue/PR number always refers to the test repository.
+Earlier production repository names, URLs and CLI examples identify the source template. Before executing any issue/PR/branch operation or example command, substitute the test repository; a bare issue/PR number always means the test repository.
+Apply this same override to every linked command and sub-prompt. In particular, replace copied project #3 and project-field IDs with verified test project #4 values, or skip the optional parent-link step when those values cannot be resolved.
+Verify the repository identity before every mutation. Never mutate production from this test invocation.
+Public production source may be read for provenance using its fully qualified repository or URL.
 All refinement, current-head pytest, independent-review and merge-owner gates remain unchanged. No reserve, billing or production setting may be changed.
