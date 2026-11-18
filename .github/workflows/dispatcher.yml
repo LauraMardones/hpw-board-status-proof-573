@@ -13,7 +13,7 @@ permissions:
   contents: read
 jobs:
   independent-marker-review:
-    if: github.ref == 'refs/heads/codex/issue-5-independent-review'
+    if: github.ref == 'refs/heads/codex/test-marker-review'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
