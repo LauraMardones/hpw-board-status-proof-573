@@ -337,3 +337,30 @@ jobs:
       - name: Write the board status
         if: ${{ !cancelled() && needs.dispatch.outputs.enabled == 'true' }}
         run: bash scripts/dispatcher-workflow-step.sh status-sync
+
+  # Temporary read-only credential/allowance probe. Never merged into the tested main.
+  subscription-preflight:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/codex/issue-1-subscription-preflight'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout unchanged trusted test main
+        uses: actions/checkout@v4
+        with:
+          ref: af2d6eaa3cfa3c59696f8b6f72dd031e3b5ec239
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install existing Python runtime
+        run: pip install -e .
+      - name: Install pinned Claude Code
+        run: npm install -g @anthropic-ai/claude-code@2.1.296
+      - name: Check unchanged subscription allowance gate
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          RESERVE_FIVE_HOUR_PERCENT: ${{ vars.RESERVE_FIVE_HOUR_PERCENT }}
+          RESERVE_WEEKLY_PERCENT: ${{ vars.RESERVE_WEEKLY_PERCENT }}
+        run: bash scripts/dispatcher-allowance.sh
