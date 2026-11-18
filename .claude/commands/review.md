@@ -1,4 +1,4 @@
-Review PR #$ARGUMENTS in LauraMardones/headless-pr-workflow.
+Review PR #$ARGUMENTS in LauraMardones/hpw-board-status-proof-573.
 
 Follow:
 - docs/MERGE-POLICY.md
@@ -89,7 +89,7 @@ Required behavior:
    - put the summary as its own block at the top of the review body, above the Session Summary; never rely on a `Deviation:` line as the only place that carries it
    - set `Reviewer provider:` to the provider running this review session (`claude` for Claude Code, `codex` for Codex); the approval gate rejects the summary when that provider is the one that implemented the PR, per the linked story's `executor:` label, so do not record it in that case and report that a different provider must review
    - ensure the approval evidence is recorded against the current head SHA
-   - after posting a separate-session review summary, run `hpw approval-check $ARGUMENTS --repo LauraMardones/headless-pr-workflow` and confirm it prints `separate-session review: accepted`
+   - after posting a separate-session review summary, run `hpw approval-check $ARGUMENTS --repo LauraMardones/hpw-board-status-proof-573` and confirm it prints `separate-session review: accepted`
    - if it is not accepted, post one corrected review on the same head SHA and run the check again
    - if it is still not accepted, do not claim the PR is ready to merge: record no approval, name the rejected evidence in `--blockers`, do not use `--next merge` (use `--next implementation`, the only other value the script accepts), and add a `--deviation` saying that only the review evidence needs redoing, not the code
    - if `hpw approval-check` cannot be run in the session, say so with `--deviation`; the verbatim-template rule still applies
@@ -104,7 +104,7 @@ Required behavior:
      Catch-all issue: #<n>
      ```
 
-     then run `hpw resolve-catch-all-thread $ARGUMENTS --thread <thread-node-id> --issue <n> --head <current-head-sha> --repo LauraMardones/headless-pr-workflow`. It resolves the thread only after fresh checks of the PR, its head, the thread, the reply lines and the catch-all issue. Never resolve such a thread any other way
+     then run `hpw resolve-catch-all-thread $ARGUMENTS --thread <thread-node-id> --issue <n> --head <current-head-sha> --repo LauraMardones/hpw-board-status-proof-573`. It resolves the thread only after fresh checks of the PR, its head, the thread, the reply lines and the catch-all issue. Never resolve such a thread any other way
    - if the helper exits non-zero or cannot run (`gh` or GraphQL unavailable), the finding counts as waiver kind for this round: its thread stays unresolved, the waiver bullets below apply to it, and a `--deviation` line names the failed check
    - when the only findings left are catch-all-kind ones and the helper confirmed every one of their threads resolved, nothing waits for the PO: approve, or record the separate-session review summary, as above, so the story moves to `In merge`, and use `--next merge`; name each finding, its catch-all issue and its resolved thread in a `--deviation` line
    - a waiver-kind finding keeps the PR unmergeable until the PO waives it (`Type: decision` blocker), so do not use `--next merge` while one is unwaived
@@ -124,3 +124,12 @@ Do not rely on chat-only feedback as workflow-authoritative if it is not also re
 - If no blockers and no unwaived waiver-kind Out of scope findings remain, and every catch-all-kind thread is confirmed resolved by `hpw resolve-catch-all-thread`: submit with event `APPROVE`, or leave a separate-session review summary with its `Reviewer provider:` line if GitHub blocks self-approval.
 
 The Session Summary block is **unconditionally required**. Generate it with `scripts/session-summary.sh --command review --pr $ARGUMENTS --head <reviewed-sha> --checks <checks> --blockers <blockers> --next <implementation|merge>` and post the exact stdout with the formal review. Use `--next implementation` when blockers require another implementation cycle or an unwaived waiver-kind Out of scope finding waits for the PO, and `--next merge` only when neither remains. Supply every required argument; use explicit values such as `--blockers none`. Use repeatable `--deviation <text>` flags for deviations, residual risks, or decisions. Do not add any recap section or freeform PR-body/AC repetition after the generated block.
+
+## Isolated proof repository context
+
+This command is installed only in the PO-approved test environment for production #573.
+For this invocation, the repository is LauraMardones/hpw-board-status-proof-573 and the only test board is LauraMardones/4.
+Apply that same repository and board context to every linked command, sub-prompt and source-document example, even when a copied file contains the production repository name or project #3.
+Verify the repository identity before every issue, PR, branch or project mutation. Never mutate production from this test invocation.
+Public production source may be read for provenance using its fully qualified repository or URL; a bare issue/PR number always refers to the test repository.
+All refinement, current-head pytest, independent-review and merge-owner gates remain unchanged. No reserve, billing or production setting may be changed.
