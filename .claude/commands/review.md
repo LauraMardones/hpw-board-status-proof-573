@@ -124,3 +124,13 @@ Do not rely on chat-only feedback as workflow-authoritative if it is not also re
 - If no blockers and no unwaived waiver-kind Out of scope findings remain, and every catch-all-kind thread is confirmed resolved by `hpw resolve-catch-all-thread`: submit with event `APPROVE`, or leave a separate-session review summary with its `Reviewer provider:` line if GitHub blocks self-approval.
 
 The Session Summary block is **unconditionally required**. Generate it with `scripts/session-summary.sh --command review --pr $ARGUMENTS --head <reviewed-sha> --checks <checks> --blockers <blockers> --next <implementation|merge>` and post the exact stdout with the formal review. Use `--next implementation` when blockers require another implementation cycle or an unwaived waiver-kind Out of scope finding waits for the PO, and `--next merge` only when neither remains. Supply every required argument; use explicit values such as `--blockers none`. Use repeatable `--deviation <text>` flags for deviations, residual risks, or decisions. Do not add any recap section or freeform PR-body/AC repetition after the generated block.
+
+## Mandatory override for the isolated proof environment
+
+This final section overrides all earlier repository and board literals in this copied command.
+For this invocation, the repository is LauraMardones/hpw-board-status-proof-573 and the only test board is LauraMardones/4.
+Earlier production repository names, URLs and CLI examples identify the source template. Before executing any issue/PR/branch operation or example command, substitute the test repository; a bare issue/PR number always means the test repository.
+Apply this same override to every linked command and sub-prompt. In particular, replace copied project #3 and project-field IDs with verified test project #4 values, or skip the optional parent-link step when those values cannot be resolved.
+Verify the repository identity before every mutation. Never mutate production from this test invocation.
+Public production source may be read for provenance using its fully qualified repository or URL.
+All refinement, current-head pytest, independent-review and merge-owner gates remain unchanged. No reserve, billing or production setting may be changed.

@@ -143,3 +143,13 @@ Record workflow-relevant facts in GitHub, not only in chat.
 **Handoff comment posted on the PR** at completion using the available GitHub operation fallback.
 
 Generate the handoff with `scripts/session-summary.sh --command implement` and all required phase arguments, then post the exact stdout. Do not add prose or sections after the generated block.
+
+## Mandatory override for the isolated proof environment
+
+This final section overrides all earlier repository and board literals in this copied command.
+For this invocation, the repository is LauraMardones/hpw-board-status-proof-573 and the only test board is LauraMardones/4.
+Earlier production repository names, URLs and CLI examples identify the source template. Before executing any issue/PR/branch operation or example command, substitute the test repository; a bare issue/PR number always means the test repository.
+Apply this same override to every linked command and sub-prompt. In particular, replace copied project #3 and project-field IDs with verified test project #4 values, or skip the optional parent-link step when those values cannot be resolved.
+Verify the repository identity before every mutation. Never mutate production from this test invocation.
+Public production source may be read for provenance using its fully qualified repository or URL.
+All refinement, current-head pytest, independent-review and merge-owner gates remain unchanged. No reserve, billing or production setting may be changed.
