@@ -36,5 +36,5 @@ jobs:
           print(json.dumps({"github_api_quota": {"core": rest, "graphql": gql}}), flush=True)
           assert rest["remaining"] >= 200 and gql["remaining"] >= 200
           PY
-      - name: Ordinary Claude capacity gate - approved Haiku probe 1 of 2
+      - name: Ordinary Claude capacity gate - approved Haiku probe 2 of 2
         run: bash scripts/dispatcher-allowance.sh
