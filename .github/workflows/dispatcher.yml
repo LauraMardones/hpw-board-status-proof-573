@@ -1,339 +1,40 @@
-# Dispatcher workflow — autonomous story-level execution entry point
-#
-# 2026-08-09: touched to re-arm the schedule trigger after GitHub Actions
-# stopped firing the cron for this workflow (no runs between Aug 7 07:09
-# and Aug 9, despite the workflow remaining active and no config change).
-#
-# 2026-08-10 (issue #252): the "Run dispatcher invoke" step never wired any
-# executor secret into its env:, so no dispatcher-driven /implement invocation
-# could ever authenticate regardless of what was configured in repository
-# Settings. The executor secrets are now explicitly referenced below.
-#
-# 2026-10-14 (issue #314, ADR-012): every Claude session runs Claude Code on
-# the runner, signed in with CLAUDE_CODE_OAUTH_TOKEN (the PO's subscription).
-# The metered Anthropic key is no longer wired in and must not be added back.
-#
-# 2026-10-16 (issue #315): the last metered path is gone. The invoke step's env:
-# names CLAUDE_CODE_OAUTH_TOKEN as its only model-provider secret. The poll
-# reports review_due (a Codex-implemented story "In review" with an open,
-# non-draft PR), and resumable counts it, so the invoke step reviews that PR on
-# the subscription even when nothing else is due.
-#
-# 2026-10-16 (issue #339, ADR-013): a hosted HTTP cron service starts this
-# workflow every 5 minutes through workflow_dispatch on main; the cron below
-# stays as the backup. The "Check the dispatch trigger" step queues a
-# dispatch_trigger_stopped alert when the newest dispatched run on main is more
-# than 15 minutes old. Triggers, permissions: and concurrency are unchanged.
-# Setup and token rotation: docs/DISPATCHER-CONFIG.md → "Dispatcher trigger".
-#
-# 2026-10-16 (issue #337): the checkout keeps no credentials and has the full
-# history, and a step before the invoke makes plain `git push` authenticate
-# through `gh` with PROJECT_TOKEN. A session no longer needs a git override.
-#
-# 2026-09-27 (issue #257): .dispatcher-state/ survives ephemeral runners. It
-# is restored from actions/cache before the poll and saved under a unique
-# per-run key right after it. Only default-branch runs write it, because
-# caches are ref-scoped; a manual run on another ref polls with --dry-run
-# against the default-branch snapshot. Workflow-level concurrency serializes
-# scheduled and manual runs so two runs never read the same snapshot and race
-# to write it. Interim until #259. Issue #474 retired the ready-for-refinement
-# notification, whose state this was first; the steps keep their names and now
-# carry the actionable-events state of issue #295.
-#
-# 2026-10-14 (issue #295): notifications that need PO action are queued in the
-# same .dispatcher-state/ by dispatcher-invoke.sh and sent, retried and bounded
-# by the "Retry actionable Slack notifications" step, which runs every cycle
-# even when the invoke step is skipped. The state is saved right after the poll
-# and again after that step, so a cancelled invoke step cannot lose the poll's
-# state.
-#
-# 2026-10-31 (issue #352): a registration that fails (storage and Slack both
-# down) makes dispatcher-invoke.sh exit 1 at its end, naming the lost event; the
-# usage-limit notice, session-state save, retry and state save steps still run
-# after that red step. The state save also runs after a cancellation. An
-# unreadable actionable-events file is never overwritten; the retry step fails red.
-#
-# 2026-11-07 (issue #319): the optional workflow_dispatch input refine_issue
-# runs only dispatcher-invoke.sh --refine <n> in the invoke step, behind the same
-# guard, session state cache and Claude Code install; the poll's choice is
-# ignored for that run. With the input empty the run is unchanged.
-#
-# 2026-11-06 (issue #434, ADR-014 → Block 3): every run: is one command. The
-# decisions of the steps (guard, state-writer rule, cache dates, --dry-run and
-# --issue/--resume choices, usage-limit context, gh auth setup-git) are in
-# scripts/dispatcher-workflow-step.sh, and NEXT_ISSUE, RESUMABLE and the
-# evidence:pending read are in dispatcher-poll.sh, so pytest reaches them. "Save
-# poll notification state" now runs under always() like the other state saves.
-# Step names, order, other if: conditions and cache keys are unchanged.
-#
-# 2026-10-13 (issue #293): the invoke step also runs when the poll reports a
-# story in the merge step or in implementation, so the dispatcher can resume a
-# story after the Codex review loop answered.
-#
-# 2026-11-13 (issue #478): the new step "Write the board status" runs the
-# board's only status writer (`hpw dispatcher status sync`) once per enabled
-# run, after the invoke step; the dispatcher scripts write no board status.
-#
-# 2026-11-08 (issue #474, ADR-010): new work comes from the scheduler
-# (`hpw dispatcher scheduler next`), never from a "Ready" board status. The poll
-# asks it to decide whether the invoke step runs (issue_number is the
-# scheduler's choice); the invoke step runs dispatcher-invoke.sh with --repo
-# only, which handles work in flight first and then asks the scheduler again.
-# The ready-for-refinement notification is retired. The invoke step's if: is
-# unchanged in meaning.
-#
-# Prototype divergences:
-# D1: dispatcher-poll.sh does not yet exist on main (story #170 is in review).
-#     This workflow references the script by path; the run step will fail gracefully
-#     if the script is absent until #170 lands. No guard is added here — the log
-#     output of a missing script is diagnostic and sufficient.
-
-name: Dispatcher
-
+name: Proof retry admission
 on:
-  schedule:
-    - cron: "*/5 * * * *"
   workflow_dispatch:
-    inputs:
-      refine_issue:
-        description: "Issue number to refine: runs only dispatcher-invoke.sh --refine <n> (issue #319)"
-        type: string
-        required: false
-        default: ""
-
-# One dispatcher run at a time per repository: scheduled and manual runs share
-# the same group, and queued runs wait instead of cancelling an in-progress
-# run, so dispatcher state is never written by two runs at once and only one
-# model session runs at a time.
-concurrency:
-  group: dispatcher-${{ github.repository }}
-  cancel-in-progress: false
-
+permissions:
+  contents: read
 jobs:
-  dispatch:
+  admission:
+    if: github.ref == 'refs/heads/codex/test-retry-admission'
     runs-on: ubuntu-latest
-    outputs:
-      enabled: ${{ steps.guard.outputs.enabled }}
-      state_writer: ${{ steps.scope.outputs.state_writer }}
+    timeout-minutes: 5
     env:
       GH_TOKEN: ${{ secrets.PROJECT_TOKEN }}
-      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-      # Issue #546: the facts and status readers (hpw dispatcher scheduler next,
-      # status sync) count a PO /unblock only for this login, and have no
-      # default. Without it every decision blocker stays open.
-      DECISION_BLOCKER_PO_LOGIN: LauraMardones
-
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      RESERVE_FIVE_HOUR_PERCENT: ${{ vars.RESERVE_FIVE_HOUR_PERCENT }}
+      RESERVE_WEEKLY_PERCENT: ${{ vars.RESERVE_WEEKLY_PERCENT }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
-          # Issue #337: no token is written into .git/config (the job token
-          # cannot push here and its extraheader overrides GH_TOKEN), and the
-          # full history lets a session merge origin/main without --unshallow.
+          ref: 4e6e598a0d8eaf011367e4c7334fd083c3d856fa
           persist-credentials: false
-          fetch-depth: 0
-
-      - name: Guard — check DISPATCHER_ENABLED
-        id: guard
-        env:
-          DISPATCHER_ENABLED: ${{ vars.DISPATCHER_ENABLED }}
-        run: bash scripts/dispatcher-workflow-step.sh guard
-
-      # Actions caches are scoped by ref: a cache saved on a non-default ref is
-      # invisible to the scheduled run on the default branch. Only default-branch
-      # runs (every scheduled run, and manual runs dispatched on that branch)
-      # save state; a manual run on any other ref reads the default-branch
-      # snapshot and polls with --dry-run.
-      - name: Resolve notification state scope
-        if: steps.guard.outputs.enabled == 'true'
-        id: scope
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          REF: ${{ github.ref }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-        run: bash scripts/dispatcher-workflow-step.sh scope
-
-      # Restores the newest snapshot of .dispatcher-state (the actionable-events
-      # state, issue #295): restore-keys prefix matches pick the most recently
-      # created cache. A miss is not an error. The name is kept from issue #257;
-      # the refinement notification itself is retired (issue #474).
-      - name: Restore refinement notification state
-        if: steps.guard.outputs.enabled == 'true'
-        uses: actions/cache/restore@v4
+      - uses: actions/setup-python@v5
         with:
-          path: .dispatcher-state
-          key: dispatcher-state-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: |
-            dispatcher-state-
-
-      - name: Run dispatcher poll
-        if: steps.guard.outputs.enabled == 'true'
-        id: poll
-        env:
-          WIP_LIMIT_IMPLEMENTATION: ${{ vars.WIP_LIMIT_IMPLEMENTATION }}
-          READY_BUFFER_MIN: ${{ vars.READY_BUFFER_MIN }}
-          READY_BUFFER_MAX: ${{ vars.READY_BUFFER_MAX }}
-          STATE_WRITER: ${{ steps.scope.outputs.state_writer }}
-          REPO: ${{ github.repository }}
-        run: bash scripts/dispatcher-workflow-step.sh poll
-
-      # Saved right after the poll (issue #295), before the invoke step, which
-      # can run for hours and be cancelled. The poll itself writes no state
-      # since issue #474; the save keeps the restored snapshot current. The
-      # final save below writes a newer snapshot, which the prefix restore
-      # prefers.
-      - name: Save poll notification state
-        if: ${{ always() && steps.poll.outcome == 'success' && steps.guard.outputs.enabled == 'true' && steps.scope.outputs.state_writer == 'true' }}
-        uses: actions/cache/save@v4
-        with:
-          path: .dispatcher-state
-          key: dispatcher-state-${{ github.run_id }}-${{ github.run_attempt }}-poll
-
-      - name: Set cache date
-        if: steps.guard.outputs.enabled == 'true'
-        run: bash scripts/dispatcher-workflow-step.sh cache-date
-
-      - name: Restore session state cache
-        if: steps.guard.outputs.enabled == 'true' && (steps.poll.outputs.issue_number != '' || steps.poll.outputs.resumable == 'true' || inputs.refine_issue != '')
-        uses: actions/cache/restore@v4
-        with:
-          path: |
-            .dispatcher-usage
-            .dispatcher-allowance
-          key: session-state-${{ env.TODAY }}-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: |
-            session-state-${{ env.TODAY }}-
-
-      # Issue #317: the subscription allowance check (scripts/dispatcher-allowance.sh)
-      # runs one Claude Code turn before each session start, and every Claude
-      # session runs on this same install (issue #314). Pinned so the
-      # undocumented rate_limit_event shape, the session flags and what the
-      # model aliases mean change only on a deliberate bump; see
-      # docs/DISPATCHER-CONFIG.md → "Subscription allowance and reserve".
-      - name: Install Claude Code
-        if: steps.guard.outputs.enabled == 'true' && (steps.poll.outputs.issue_number != '' || steps.poll.outputs.resumable == 'true' || inputs.refine_issue != '')
+          python-version: "3.11"
+      - name: Install existing runtime
+        run: pip install -e .
+      - name: Install pinned Claude Code
         run: npm install -g @anthropic-ai/claude-code@2.1.296
-
-      # Issue #337: git asks gh for credentials, so a session's plain git push
-      # authenticates with PROJECT_TOKEN and no token is written to git config.
-      - name: Configure git to authenticate through gh
-        if: steps.guard.outputs.enabled == 'true' && (steps.poll.outputs.issue_number != '' || steps.poll.outputs.resumable == 'true' || inputs.refine_issue != '')
-        env:
-          GH_TOKEN: ${{ secrets.PROJECT_TOKEN }}
-        run: bash scripts/dispatcher-workflow-step.sh git-auth
-
-      - name: Run dispatcher invoke
-        if: steps.guard.outputs.enabled == 'true' && (steps.poll.outputs.issue_number != '' || steps.poll.outputs.resumable == 'true' || inputs.refine_issue != '')
-        id: invoke
-        env:
-          WIP_LIMIT_IMPLEMENTATION: ${{ vars.WIP_LIMIT_IMPLEMENTATION }}
-          READY_BUFFER_MIN: ${{ vars.READY_BUFFER_MIN }}
-          READY_BUFFER_MAX: ${{ vars.READY_BUFFER_MAX }}
-          USAGE_LIMIT_SESSIONS_PER_DAY: ${{ vars.USAGE_LIMIT_SESSIONS_PER_DAY }}
-          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          RESERVE_FIVE_HOUR_PERCENT: ${{ vars.RESERVE_FIVE_HOUR_PERCENT }}
-          RESERVE_WEEKLY_PERCENT: ${{ vars.RESERVE_WEEKLY_PERCENT }}
-          CODEX_FIX_ROUND_MAX: ${{ vars.CODEX_FIX_ROUND_MAX }}
-          REFINE_ISSUE: ${{ inputs.refine_issue }}
-          STATE_WRITER: ${{ steps.scope.outputs.state_writer }}
-          REPO: ${{ github.repository }}
-        run: bash scripts/dispatcher-workflow-step.sh invoke
-
-      # Issue #320: sent in the run in which the limit stopped a session. The
-      # marker is written only after a send without an error, so a failed
-      # delivery is tried again on the next run. The save step below
-      # keeps it in the day's cache entry.
-      - name: Notify usage limit reached
-        if: ${{ !cancelled() && steps.guard.outputs.enabled == 'true' && steps.invoke.outputs.usage_limit_reached == 'true' }}
-        env:
-          USAGE_LIMIT_SESSIONS_PER_DAY: ${{ vars.USAGE_LIMIT_SESSIONS_PER_DAY }}
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-          REPO: ${{ github.repository }}
-        run: bash scripts/dispatcher-workflow-step.sh usage-limit-notify
-
-      # Issue #320: runs even when the invoke step failed, so a session that
-      # failed is still counted and a loop of failing restarts reaches the limit.
-      # The counter is dated by the day each session started, which can be
-      # later than the day this run began; save under the day it ends on.
-      - name: Set cache save date
-        if: always() && steps.guard.outputs.enabled == 'true'
-        run: bash scripts/dispatcher-workflow-step.sh cache-save-date
-
-      - name: Save session state cache
-        if: always() && steps.guard.outputs.enabled == 'true' && (steps.poll.outputs.issue_number != '' || steps.poll.outputs.resumable == 'true' || inputs.refine_issue != '')
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            .dispatcher-usage
-            .dispatcher-allowance
-          key: session-state-${{ env.SAVE_DAY }}-${{ github.run_id }}-${{ github.run_attempt }}
-
-      # Issue #339 (ADR-013): queues one dispatch_trigger_stopped event when the
-      # newest workflow_dispatch run on main is more than 15 minutes old, for
-      # the retry step below to send. Runs on every enabled cycle whatever
-      # started it, before the retry step, with the retry step's conditions. A
-      # non-default ref only reports (--dry-run). It never fails the run on an
-      # API read error.
-      - name: Check the dispatch trigger
-        if: ${{ !cancelled() && steps.poll.outcome == 'success' && steps.guard.outputs.enabled == 'true' }}
-        env:
-          STATE_WRITER: ${{ steps.scope.outputs.state_writer }}
-          REPO: ${{ github.repository }}
-        run: bash scripts/dispatcher-workflow-step.sh trigger-check
-
-      # Issue #295: delivers and retries the Slack notifications that need PO
-      # action (decision blocker, Feature closure, Epic closure). It runs on
-      # every enabled cycle, including when no story is ready or resumable and
-      # the invoke step is skipped, and even after the invoke step failed, but
-      # not after a failed poll: the state is saved only after a successful poll,
-      # so a delivery recorded then would be lost and sent again. A
-      # failed delivery does not fail the step until it has failed for 3 cycles
-      # in a row, then the run is red. A non-default ref only reports what it
-      # would send (--dry-run), like the poll.
-      - name: Retry actionable Slack notifications
-        if: ${{ !cancelled() && steps.poll.outcome == 'success' && steps.guard.outputs.enabled == 'true' }}
-        env:
-          STATE_WRITER: ${{ steps.scope.outputs.state_writer }}
-          REPO: ${{ github.repository }}
-        run: bash scripts/dispatcher-workflow-step.sh retry
-
-      # Saved on every enabled default-branch run, after the invoke and retry
-      # steps (issue #295), so state they changed survives even when one of them
-      # fails. Issue #352: also when the job is cancelled or times out, so an
-      # event the invoke step queued before the cancellation is not lost; the
-      # guards (enabled, successful poll, state writer) stay. The state file is
-      # written through a temporary file and mv, so the saved copy is whole.
-      # Not only when an issue is ready for implementation. Cache entries
-      # are immutable, so each run writes a new unique key that the next run's
-      # prefix restore picks up.
-      - name: Save refinement notification state
-        if: ${{ always() && steps.poll.outcome == 'success' && steps.guard.outputs.enabled == 'true' && steps.scope.outputs.state_writer == 'true' }}
-        uses: actions/cache/save@v4
-        with:
-          path: .dispatcher-state
-          key: dispatcher-state-${{ github.run_id }}-${{ github.run_attempt }}
-
-  # Issue #573: event writes can run while dispatch invokes a session. Only
-  # this short job joins the event writer's group; dispatch keeps its own group.
-  board-status:
-    needs: dispatch
-    if: ${{ !cancelled() && needs.dispatch.outputs.enabled == 'true' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    concurrency:
-      group: board-status-${{ github.repository }}
-      cancel-in-progress: false
-    env:
-      GH_TOKEN: ${{ secrets.PROJECT_TOKEN }}
-      DECISION_BLOCKER_PO_LOGIN: LauraMardones
-      STATE_WRITER: ${{ needs.dispatch.outputs.state_writer }}
-      REPO: ${{ github.repository }}
-    steps:
-      - name: Checkout board writer
-        uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-
-      - name: Write the board status
-        if: ${{ !cancelled() && needs.dispatch.outputs.enabled == 'true' }}
-        run: bash scripts/dispatcher-workflow-step.sh status-sync
+      - name: Require actual workflow-token GitHub headroom
+        run: |
+          python - <<'PY'
+          import json, subprocess
+          def gh(*args):
+              return json.loads(subprocess.run(["gh", "api", *args], check=True, capture_output=True, text=True).stdout)
+          rest = gh("rate_limit")["resources"]["core"]
+          gql = gh("graphql", "-f", "query=query Proof573RetryAdmission { rateLimit { limit remaining resetAt cost } }")["data"]["rateLimit"]
+          print(json.dumps({"github_api_quota": {"core": rest, "graphql": gql}}), flush=True)
+          assert rest["remaining"] >= 200 and gql["remaining"] >= 200
+          PY
+      - name: Ordinary Claude capacity gate - approved Haiku probe 1 of 2
+        run: bash scripts/dispatcher-allowance.sh
